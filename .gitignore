@@ -1,0 +1,3 @@
+# Build output of the .NET test projects under Tests~.
+bin/
+obj/

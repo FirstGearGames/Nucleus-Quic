@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <!--
+        Builds the transport outside Unity the way Unity compiles it: netstandard2.1, C# 9, unsafe code, and against Nucleus.dll's public
+        and protected surface only. The Unity-only files compile out on their UNITY_ symbols. Point NucleusAssembliesDirectory at the
+        folder holding the Nucleus.dll and CodeBoost.dll the Unity project uses.
+    -->
+    <PropertyGroup>
+        <TargetFramework>netstandard2.1</TargetFramework>
+        <LangVersion>9</LangVersion>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <ImplicitUsings>disable</ImplicitUsings>
+        <Nullable>disable</Nullable>
+        <IsPackable>false</IsPackable>
+        <AssemblyName>Nucleus.Integrations.Unity.Quic</AssemblyName>
+        <RootNamespace>Nucleus.Integrations.Unity.Transports</RootNamespace>
+        <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+        <NucleusAssembliesDirectory Condition="'$(NucleusAssembliesDirectory)' == ''">D:\Development\Nucleus\Unity Integration\Nucleus - Unity Integration\Assets\Nucleus</NucleusAssembliesDirectory>
+    </PropertyGroup>
+
+    <!-- The documentation file is generated so the compiler checks every cref. -->
+    <PropertyGroup>
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <WarningsAsErrors>$(WarningsAsErrors);CS1570;CS1571;CS1572;CS1574;CS1580;CS1581;CS1584;CS1710;CS1711;CS1734</WarningsAsErrors>
+        <NoWarn>$(NoWarn);CS1591</NoWarn>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Compile Include="..\..\*.cs" />
+        <Compile Include="..\..\Native\*.cs" />
+        <Reference Include="Nucleus" HintPath="$(NucleusAssembliesDirectory)\Nucleus.dll" />
+        <Reference Include="CodeBoost" HintPath="$(NucleusAssembliesDirectory)\CodeBoost.dll" />
+    </ItemGroup>
+
+</Project>

@@ -1,0 +1,19 @@
+{
+    "name": "Nucleus.Integrations.Unity.Quic",
+    "rootNamespace": "Nucleus.Integrations.Unity.Transports",
+    "references": [
+        "Nucleus.Integrations.Unity"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": true,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "Nucleus.dll",
+        "CodeBoost.dll"
+    ],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
