@@ -18,6 +18,7 @@ namespace Nucleus.Integrations.Unity.Transports
     /// a browser above all, connects with that hash in <see cref="CertificateHash"/>.
     /// </remarks>
     [DisallowMultipleComponent]
+    [NucleusHelpUrl(typeof(QuicTransport))]
     public class QuicTransport : NetworkTransport
     {
         /// <summary>
