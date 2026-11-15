@@ -20,7 +20,8 @@ Where each build gets its QUIC library:
 
 This folder is a Unity package (`com.firstgeargames.nucleus.quic`). Either:
 
-- In the Package Manager, choose **Install package from disk** and pick this folder's `package.json`, or add `"com.firstgeargames.nucleus.quic": "file:<path to this folder>"` to `Packages/manifest.json`.
+- In the Package Manager, choose **Install package from git URL** and enter `https://github.com/FirstGearGames/Nucleus-Quic.git`. Add `#v1.0.0` to the end to pin a release.
+- Or, in the Package Manager, choose **Install package from disk** and pick this folder's `package.json`, or add `"com.firstgeargames.nucleus.quic": "file:<path to this folder>"` to `Packages/manifest.json`.
 - Or copy the folder into your project's `Packages` or `Assets` folder.
 
 ## Quick start
