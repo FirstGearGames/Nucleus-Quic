@@ -11,9 +11,9 @@ namespace Nucleus.Integrations.Unity.Transports
     /// </summary>
     /// <remarks>
     /// The Schannel build cannot read PKCS #12 itself, unlike the OpenSSL build every other platform uses. Schannel signs in the system's
-    /// security process, which cannot reach a key held only in this one, so the key is written to the user's key store under a fresh name
-    /// and deleted again when the listener stops, as .NET does for a certificate it imports. A process killed before then leaves that one
-    /// key file behind.
+    /// security process, which cannot reach a key held only in this one, so the key is written to the user's key store under a fresh name.
+    /// It is deleted again as soon as MsQuic has loaded the credential, which holds the key from then on, so only a process killed in the
+    /// few milliseconds between leaves that key file behind.
     /// </remarks>
     internal sealed class WindowsCertificate
     {
@@ -58,16 +58,23 @@ namespace Nucleus.Integrations.Unity.Transports
         }
 
         /// <summary>
-        /// Deletes the key from the user's key store and releases the certificate and its store.
+        /// Deletes the key from the user's key store, once Schannel holds the credential made with it.
+        /// </summary>
+        internal void DeleteKey()
+        {
+            // Deleting the key also frees its handle; a handle the context only lends is left alone.
+            if (CertificateContext != IntPtr.Zero && CryptAcquireCertificatePrivateKey(CertificateContext, AcquireOnlyNCryptKeyFlag | AcquireSilentFlag, IntPtr.Zero, out IntPtr keyHandle, out _, out bool isKeyHandleOwned) && isKeyHandleOwned)
+                NCryptDeleteKey(keyHandle, 0);
+        }
+
+        /// <summary>
+        /// Deletes the key from the user's key store when it is still there, and releases the certificate and its store.
         /// </summary>
         internal void Release()
         {
             if (CertificateContext != IntPtr.Zero)
             {
-                // Deleting the key also frees its handle; a handle the context only lends is left alone.
-                if (CryptAcquireCertificatePrivateKey(CertificateContext, AcquireOnlyNCryptKeyFlag | AcquireSilentFlag, IntPtr.Zero, out IntPtr keyHandle, out _, out bool isKeyHandleOwned) && isKeyHandleOwned)
-                    NCryptDeleteKey(keyHandle, 0);
-
+                DeleteKey();
                 CertFreeCertificateContext(CertificateContext);
             }
 

@@ -231,6 +231,10 @@ namespace Nucleus.Integrations.Unity.Transports
                 MsQuic.CredentialConfig credentialConfig = new() { Type = MsQuic.CertificateContextCredentialType, Certificate = (void*)startingQuicListener._windowsCertificate.CertificateContext };
 
                 credentialStatus = msQuic.ConfigurationLoadCredential(startingQuicListener._configuration, &credentialConfig);
+
+                // The loaded credential holds the key, so the stored copy goes at once rather than at the stop a crash would never reach.
+                if (msQuic.IsSucceeded(credentialStatus))
+                    startingQuicListener._windowsCertificate.DeleteKey();
             }
             else
             {

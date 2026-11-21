@@ -64,7 +64,7 @@ A browser only connects to a server whose certificate it trusts. There are two w
 ## Things that look like bugs but are not
 
 - **The server's certificate hash changes every restart.** A certificate the server makes itself is new each time. Use a certificate file when clients need a hash that stays the same.
-- **On Windows, a key appears in the user's key store while the server runs.** Windows' TLS runs in a system process that can only use a stored key. The server deletes it when it stops.
+- **On Windows, a key is written to the user's key store as the server starts.** Windows' TLS runs in a system process that can only load a stored key. The server deletes it again as soon as that process has loaded it.
 - **A browser client drops at once when its tab closes.** A browser cannot wait for its last packets to be acknowledged. A server kick does wait, so the kick reason arrives.
 
 ## Tests

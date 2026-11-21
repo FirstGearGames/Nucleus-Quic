@@ -6,6 +6,7 @@ using System.Net;
 using System.Net.Quic;
 using System.Net.Security;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
 using System.Security.Authentication;
 using System.Security.Cryptography;
@@ -214,6 +215,32 @@ public partial class QuicLiveTests
         await DisposeAnsweredConnectionAsync(answeringTask);
 
         Assert.True(clientState is LocalConnectionState.Disconnected, $"The client reached [{clientState}] with a server whose pinned certificate is valid for 30 days.");
+    }
+
+    /// <summary>
+    /// A running Windows server holds no key of its certificate in the user's key store, so a process killed while it runs leaves none
+    /// behind, and it still completes a client's handshake.
+    /// </summary>
+    [Fact(Timeout = 60000)]
+    public async Task LiveWebTransport_ARunningWindowsServer_LeavesNoKeyInTheUserKeyStore()
+    {
+        // Only the Schannel build on Windows imports the certificate into a key store.
+        if (!OperatingSystem.IsWindows())
+            return;
+
+        ushort port = ProbeFreeUdpPort();
+        (CoreManager server, Quic serverTransport) = await StartServerAsync(port);
+        string keyName = ReadServerCertificateKeyName(serverTransport);
+        bool isKeyStored = CngKey.Exists(keyName, CngProvider.MicrosoftSoftwareKeyStorageProvider);
+
+        (CoreManager client, Quic clientTransport) = await ConnectClientAsync(port, serverTransport.ServerCertificateHash);
+
+        await DriveUntilAsync(server, client, () => IsClientAuthenticated(client));
+
+        await clientTransport.ShutdownAsync();
+        await serverTransport.ShutdownAsync();
+
+        Assert.False(isKeyStored, $"The running server's certificate key [{keyName}] was in the user's key store, where a crash would leave it.");
     }
 
     /// <summary>
@@ -685,6 +712,46 @@ public partial class QuicLiveTests
 
         return queuedPacketCount;
     }
+
+    /// <summary>
+    /// Reads the name of the key a running Windows server's certificate was imported with, from the certificate context its listener holds.
+    /// </summary>
+    /// <param name="serverTransport">The server's transport.</param>
+    /// <returns>The key's name in the user's key store.</returns>
+    /// <remarks>Read from the context's key provider property rather than by opening the key, which may already be gone.</remarks>
+    [SupportedOSPlatform("windows")]
+    private static string ReadServerCertificateKeyName(Quic serverTransport)
+    {
+        const BindingFlags InstanceFieldFlags = BindingFlags.Instance | BindingFlags.NonPublic;
+        const uint KeyProviderInfoPropertyId = 2;
+
+        object quicListener = typeof(QuicServerSocket).GetField("_quicListener", InstanceFieldFlags)!.GetValue(serverTransport.ServerSocket)!;
+        object windowsCertificate = quicListener.GetType().GetField("_windowsCertificate", InstanceFieldFlags)!.GetValue(quicListener)!;
+        IntPtr certificateContext = (IntPtr)windowsCertificate.GetType().GetProperty("CertificateContext", InstanceFieldFlags)!.GetValue(windowsCertificate)!;
+        uint keyProviderInfoLength = 0;
+
+        Assert.True(CertGetCertificateContextProperty(certificateContext, KeyProviderInfoPropertyId, IntPtr.Zero, ref keyProviderInfoLength));
+
+        IntPtr keyProviderInfo = Marshal.AllocHGlobal((int)keyProviderInfoLength);
+
+        try
+        {
+            Assert.True(CertGetCertificateContextProperty(certificateContext, KeyProviderInfoPropertyId, keyProviderInfo, ref keyProviderInfoLength));
+
+            // CRYPT_KEY_PROV_INFO opens with the container name.
+            return Marshal.PtrToStringUni(Marshal.ReadIntPtr(keyProviderInfo))!;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(keyProviderInfo);
+        }
+    }
+
+    /// <summary>
+    /// Reads a property of a certificate context.
+    /// </summary>
+    [DllImport("crypt32.dll", SetLastError = true)]
+    private static extern bool CertGetCertificateContextProperty(IntPtr certificateContext, uint propertyId, IntPtr data, ref uint dataLength);
 
     /// <summary>
     /// Returns the queue a server's MsQuic threads report into.
