@@ -116,7 +116,7 @@ namespace Nucleus.Integrations.Unity.Transports
         /// The most clients the server accepts at once.
         /// </summary>
         [SerializeField]
-        [Tooltip("Server only. Most clients the server accepts at once. Zero accepts any number.")]
+        [Tooltip("Server only. Most clients the server accepts at once. Zero accepts any number. Connections past twice this are refused at their handshake.")]
         private uint _maximumConnections = ServerConfiguration.UnsetMaximumConnections;
         /// <summary>
         /// The largest packet to build before it is split.
@@ -131,10 +131,10 @@ namespace Nucleus.Integrations.Unity.Transports
         [Tooltip("Server only. Largest reliable packet in bytes a client may send; a client that sends a larger one is disconnected.")]
         private int _maximumReliablePacketSize = 1024 * 1024;
         /// <summary>
-        /// Seconds to wait for the server to answer a connect.
+        /// Seconds a client waits for the server to answer a connect, and a server waits for a new connection to open its session.
         /// </summary>
         [SerializeField]
-        [Tooltip("Seconds a client waits for the server to answer its connect before giving up. Zero uses the idle timeout.")]
+        [Tooltip("Seconds a client waits for the server to answer its connect, and a server gives a new connection to open its session, before giving up. Zero uses the idle timeout.")]
         private ushort _connectingTimeoutSeconds = 10;
         /// <summary>
         /// Seconds a connected peer waits without hearing from the other side before it drops the link.

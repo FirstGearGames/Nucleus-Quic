@@ -36,6 +36,10 @@ namespace Nucleus.Integrations.Unity.Transports
         /// </summary>
         private readonly WebTransportEvents _events;
         /// <summary>
+        /// The listener that accepted this session and counts it until it is released, or <see langword="null"/> for a client's session.
+        /// </summary>
+        private readonly QuicListener _quicListener;
+        /// <summary>
         /// Whether this is a server's session, which waits for the peer's CONNECT, rather than a client's, which sends it.
         /// </summary>
         private readonly bool _isServer;
@@ -135,14 +139,16 @@ namespace Nucleus.Integrations.Unity.Transports
         /// </summary>
         /// <param name="msQuic">The MsQuic copy the connection belongs to.</param>
         /// <param name="events">Where the session reports.</param>
+        /// <param name="quicListener">The listener that accepted a server's session, or <see langword="null"/> for a client's.</param>
         /// <param name="isServer">Whether this is a server's session.</param>
         /// <param name="maximumReliablePacketSize">The largest reliable packet the peer may send.</param>
         /// <param name="pinnedCertificateHash">The hash a client requires of the server's certificate, or <see langword="null"/>.</param>
         /// <param name="authority">The host and port a client's CONNECT names, or <see langword="null"/> on a server.</param>
-        private QuicSession(MsQuic msQuic, WebTransportEvents events, bool isServer, int maximumReliablePacketSize, byte[] pinnedCertificateHash, string authority)
+        private QuicSession(MsQuic msQuic, WebTransportEvents events, QuicListener quicListener, bool isServer, int maximumReliablePacketSize, byte[] pinnedCertificateHash, string authority)
         {
             _msQuic = msQuic;
             _events = events;
+            _quicListener = quicListener;
             _isServer = isServer;
             _maximumReliablePacketSize = maximumReliablePacketSize;
             _pinnedCertificateHash = pinnedCertificateHash;
@@ -225,25 +231,49 @@ namespace Nucleus.Integrations.Unity.Transports
         }
 
         /// <summary>
+        /// Shuts the connection down unless its session has opened, for a peer that has not opened one in time or a listener that is
+        /// stopping.
+        /// </summary>
+        /// <remarks>
+        /// Called from the network loop thread. The lock orders it against the worker opening the session, so the session is either opened
+        /// and left alone, or shut down and never opened.
+        /// </remarks>
+        internal void CloseUnlessOpened()
+        {
+            lock (_lock)
+            {
+                if (_isOpen || _isShutdownRequested || _connection == IntPtr.Zero)
+                    return;
+
+                _isShutdownRequested = true;
+                _msQuic.ConnectionShutdown(_connection, 0, MsQuic.NoErrorCode);
+            }
+        }
+
+        /// <summary>
         /// Takes up a connection a server's listener has just accepted.
         /// </summary>
         /// <param name="msQuic">The MsQuic copy the listener belongs to.</param>
         /// <param name="events">Where the session reports.</param>
+        /// <param name="quicListener">The listener, which counts the session until it is released.</param>
         /// <param name="connection">The accepted connection.</param>
         /// <param name="configuration">The server configuration to hand it.</param>
         /// <param name="remoteAddress">The address the peer connected from.</param>
         /// <param name="maximumReliablePacketSize">The largest reliable packet the peer may send.</param>
+        /// <param name="quicSession">The session, or <see langword="null"/> when the connection was refused.</param>
         /// <returns>The status for the listener to return; a failure refuses the connection.</returns>
         /// <remarks>Called from the listener's event, on an MsQuic worker thread. No event reaches the session until that event has returned.</remarks>
-        internal static int Accept(MsQuic msQuic, WebTransportEvents events, IntPtr connection, IntPtr configuration, string remoteAddress, int maximumReliablePacketSize)
+        internal static int Accept(MsQuic msQuic, WebTransportEvents events, QuicListener quicListener, IntPtr connection, IntPtr configuration, string remoteAddress, int maximumReliablePacketSize, out QuicSession quicSession)
         {
+            quicSession = null;
+
             // Configured first, so a refused connection is never given a handler, MsQuic closing a refused connection itself.
             int configurationStatus = msQuic.ConnectionSetConfiguration(connection, configuration);
 
             if (!msQuic.IsSucceeded(configurationStatus))
                 return configurationStatus;
 
-            QuicSession quicSession = new(msQuic, events, isServer: true, maximumReliablePacketSize, pinnedCertificateHash: null, authority: null)
+            quicSession = new(msQuic, events, quicListener, isServer: true, maximumReliablePacketSize, pinnedCertificateHash: null, authority: null)
             {
                 RemoteAddress = remoteAddress,
                 _connection = connection,
@@ -267,7 +297,7 @@ namespace Nucleus.Integrations.Unity.Transports
         /// <returns>True when the connection was started.</returns>
         internal static bool TryConnect(MsQuic msQuic, WebTransportEvents events, IntPtr configuration, string host, ushort port, byte[] pinnedCertificateHash, out QuicSession quicSession)
         {
-            quicSession = new(msQuic, events, isServer: false, int.MaxValue, pinnedCertificateHash, authority: $"{host}:{port}") { RemoteAddress = host };
+            quicSession = new(msQuic, events, quicListener: null, isServer: false, int.MaxValue, pinnedCertificateHash, authority: $"{host}:{port}") { RemoteAddress = host };
 
             IntPtr connection;
             int openStatus = msQuic.ConnectionOpen(msQuic.Registration, ConnectionHandlerPointer, GCHandle.ToIntPtr(quicSession._contextHandle), &connection);
@@ -826,6 +856,7 @@ namespace Nucleus.Integrations.Unity.Transports
             _streamsByHandle.Clear();
             _msQuic.ConnectionClose(connection);
             _contextHandle.Free();
+            _quicListener?.NotifySessionReleased();
         }
 
         /// <summary>

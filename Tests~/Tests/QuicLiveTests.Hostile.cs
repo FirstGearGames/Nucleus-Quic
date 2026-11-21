@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Quic;
 using System.Net.Security;
@@ -184,6 +185,87 @@ public partial class QuicLiveTests
     }
 
     /// <summary>
+    /// A client that completes its handshake and never opens a session is closed once the connecting timeout has passed, where the server's
+    /// own keep-alives would otherwise hold it open for good.
+    /// </summary>
+    [Fact(Timeout = 60000)]
+    public async Task LiveWebTransport_AConnectionThatNeverOpensASession_IsClosedAfterTheConnectingTimeout()
+    {
+        ushort port = ProbeFreeUdpPort();
+        (CoreManager server, Quic serverTransport) = await CreateServerAsync(port);
+        serverTransport.Configuration.ConnectingTimeoutSeconds = 1;
+
+        Assert.Equal(ConnectionStateChangeResult.Success, await serverTransport.ConnectAsync(Invoker.Server));
+
+        await using QuicConnection idleConnection = await ConnectRawClientAsync(port);
+        Task idleConnectionClosedTask = WaitForConnectionCloseAsync(idleConnection);
+        Stopwatch stopwatch = Stopwatch.StartNew();
+
+        await DriveUntilAsync(server, server, () => idleConnectionClosedTask.IsCompleted, () => $"The server held a connection that never opened a session for [{stopwatch.Elapsed.TotalSeconds:0.0}] seconds, past its [1] second connecting timeout.");
+
+        await serverTransport.ShutdownAsync();
+    }
+
+    /// <summary>
+    /// A server capped at one client holds at most two connections, opened or not, and refuses the rest at their handshake, rather than
+    /// taking every connection that asks and keeping each until it opens a session; once those close, it takes connections again.
+    /// </summary>
+    [Fact(Timeout = 60000)]
+    public async Task LiveWebTransport_ConnectionsPastTwiceTheCap_AreRefusedAtTheHandshake()
+    {
+        ushort port = ProbeFreeUdpPort();
+        (_, Quic serverTransport) = await CreateServerAsync(port);
+        serverTransport.SetMaximumConnections(1);
+
+        Assert.Equal(ConnectionStateChangeResult.Success, await serverTransport.ConnectAsync(Invoker.Server));
+
+        List<QuicConnection> heldConnections = new();
+
+        for (int i = 0; i < 4; i++)
+        {
+            try
+            {
+                heldConnections.Add(await ConnectRawClientAsync(port));
+            }
+            catch (QuicException)
+            {
+                // Refused at the handshake.
+            }
+        }
+
+        int heldConnectionCount = heldConnections.Count;
+
+        foreach (QuicConnection heldConnection in heldConnections)
+            await heldConnection.DisposeAsync();
+
+        // A closed connection stops counting once MsQuic releases it, which follows its close by a few round trips.
+        QuicConnection? laterConnection = null;
+        DateTime deadline = DateTime.UtcNow + BackgroundWaitTimeout;
+
+        while (laterConnection is null && DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                laterConnection = await ConnectRawClientAsync(port);
+            }
+            catch (QuicException)
+            {
+                await Task.Delay(20);
+            }
+        }
+
+        bool isLaterConnectionTaken = laterConnection is not null;
+
+        if (laterConnection is not null)
+            await laterConnection.DisposeAsync();
+
+        await serverTransport.ShutdownAsync();
+
+        Assert.True(heldConnectionCount <= 2, $"A server capped at [1] client held [{heldConnectionCount}] connections that never opened a session.");
+        Assert.True(isLaterConnectionTaken, $"The server still refused connections [{BackgroundWaitTimeout.TotalSeconds}] seconds after every connection it held had closed.");
+    }
+
+    /// <summary>
     /// Opens a bare QUIC connection to a local server, offering HTTP/3 and doing nothing more, for a test to play a hostile client.
     /// </summary>
     /// <param name="port">The server's port.</param>
@@ -314,6 +396,23 @@ public partial class QuicLiveTests
         }
 
         return response[0] == 0x01 && response[4] == 0xD9;
+    }
+
+    /// <summary>
+    /// Takes and drops every stream a peer opens until the connection closes.
+    /// </summary>
+    /// <param name="quicConnection">The connection.</param>
+    private static async Task WaitForConnectionCloseAsync(QuicConnection quicConnection)
+    {
+        try
+        {
+            while (true)
+                await (await quicConnection.AcceptInboundStreamAsync()).DisposeAsync();
+        }
+        catch (Exception exception) when (exception is QuicException or ObjectDisposedException)
+        {
+            // Closed by the peer, or disposed by the test.
+        }
     }
 
     /// <summary>

@@ -112,7 +112,7 @@ namespace Nucleus.Integrations.Unity.Transports
         }
 
         /// <inheritdoc/>
-        /// <remarks>Applied at the next server start. A client past the cap is closed as soon as its session opens.</remarks>
+        /// <remarks>Applied at the next server start. A client past the cap is closed as soon as its session opens, and a connection past twice the cap, counting those still opening, is refused at its handshake.</remarks>
         public override void SetMaximumConnections(uint maximumConnections) => ServerConfiguration.MaximumConnections = maximumConnections;
 
         /// <inheritdoc/>

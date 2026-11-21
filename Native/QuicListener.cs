@@ -1,9 +1,13 @@
 #if !UNITY_WEBGL || UNITY_EDITOR
 using System;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using CodeBoost.Logging;
+using Nucleus.Transports;
 
 namespace Nucleus.Integrations.Unity.Transports
 {
@@ -11,8 +15,9 @@ namespace Nucleus.Integrations.Unity.Transports
     /// A server's MsQuic listener and the configuration every connection it accepts is given.
     /// </summary>
     /// <remarks>
-    /// Each accepted connection becomes a <see cref="QuicSession"/> reporting to the server socket's <see cref="WebTransportEvents"/>.
-    /// Stopping the listener refuses new connections and leaves the accepted ones to their sessions, which the socket closes itself.
+    /// Each accepted connection becomes a <see cref="QuicSession"/> reporting to the server socket's <see cref="WebTransportEvents"/>, and
+    /// has until the connecting timeout to open its session. Stopping the listener refuses new connections and closes the accepted ones that
+    /// have not opened a session; the socket closes the rest itself.
     /// </remarks>
     internal sealed unsafe class QuicListener
     {
@@ -28,6 +33,32 @@ namespace Nucleus.Integrations.Unity.Transports
         /// The largest reliable packet a client may send.
         /// </summary>
         private readonly int _maximumReliablePacketSize;
+        /// <summary>
+        /// The most sessions, opened or still opening, the listener holds at once: twice the clients the server admits, or
+        /// <see cref="UnsetMaximumSessionCount"/> for no limit.
+        /// </summary>
+        /// <remarks>Twice, so a full server still has room for as many connections on their way in or out as it has clients.</remarks>
+        private readonly int _maximumSessionCount;
+        /// <summary>
+        /// How long an accepted connection has to open its session, in <see cref="Stopwatch"/> ticks.
+        /// </summary>
+        private readonly long _connectingTimeoutStopwatchTicks;
+        /// <summary>
+        /// Every session accepted, oldest first, with the <see cref="Stopwatch"/> timestamp it must have opened by.
+        /// </summary>
+        /// <remarks>
+        /// Filled on MsQuic's threads and emptied on the network loop thread. A session that opens in time stays until its time is up and
+        /// is then dropped untouched, which spares removing it from the middle.
+        /// </remarks>
+        private readonly Queue<(QuicSession Session, long OpenByTimestamp)> _acceptedSessions = new();
+        /// <summary>
+        /// Guards <see cref="_acceptedSessions"/>.
+        /// </summary>
+        private readonly object _acceptedSessionsLock = new();
+        /// <summary>
+        /// How many accepted sessions MsQuic has not yet released, changed with <see cref="Interlocked"/> on MsQuic's threads.
+        /// </summary>
+        private int _sessionCount;
         /// <summary>
         /// The handle MsQuic holds as the listener's context.
         /// </summary>
@@ -60,6 +91,10 @@ namespace Nucleus.Integrations.Unity.Transports
         /// How many one-way streams a client may have open: its control and QPACK streams, with room to spare.
         /// </summary>
         private const ushort PeerUnidirectionalStreamCount = 8;
+        /// <summary>
+        /// The value of <see cref="_maximumSessionCount"/> that sets no limit.
+        /// </summary>
+        private const int UnsetMaximumSessionCount = 0;
 
         /// <summary>
         /// Creates a listener that has not yet been opened.
@@ -67,16 +102,20 @@ namespace Nucleus.Integrations.Unity.Transports
         /// <param name="msQuic">The MsQuic copy to open it with.</param>
         /// <param name="events">Where every accepted session reports.</param>
         /// <param name="maximumReliablePacketSize">The largest reliable packet a client may send.</param>
-        private QuicListener(MsQuic msQuic, WebTransportEvents events, int maximumReliablePacketSize)
+        /// <param name="maximumConnections">The most clients the server admits, or <see cref="ServerConfiguration.UnsetMaximumConnections"/> for any number.</param>
+        /// <param name="connectingTimeoutMilliseconds">How long an accepted connection has to open its session.</param>
+        private QuicListener(MsQuic msQuic, WebTransportEvents events, int maximumReliablePacketSize, uint maximumConnections, ulong connectingTimeoutMilliseconds)
         {
             _msQuic = msQuic;
             _events = events;
             _maximumReliablePacketSize = maximumReliablePacketSize;
+            _maximumSessionCount = maximumConnections is ServerConfiguration.UnsetMaximumConnections ? UnsetMaximumSessionCount : (int)Math.Min(maximumConnections * 2UL, int.MaxValue);
+            _connectingTimeoutStopwatchTicks = (long)(connectingTimeoutMilliseconds * (ulong)Stopwatch.Frequency / 1000);
             _contextHandle = GCHandle.Alloc(this);
         }
 
         /// <summary>
-        /// Stops accepting connections and closes the configuration.
+        /// Stops accepting connections, closes every accepted one that has not opened a session, and closes the configuration.
         /// </summary>
         /// <remarks>Blocks until MsQuic has stopped the listener, so it must not be called from an MsQuic callback. Connections already accepted keep the configuration they were given.</remarks>
         internal void Stop()
@@ -85,6 +124,13 @@ namespace Nucleus.Integrations.Unity.Transports
             {
                 _msQuic.ListenerClose(_listener);
                 _listener = IntPtr.Zero;
+            }
+
+            // The server is stopping, so a session still to open would only open onto a roster that is gone.
+            lock (_acceptedSessionsLock)
+            {
+                while (_acceptedSessions.Count > 0)
+                    _acceptedSessions.Dequeue().Session.CloseUnlessOpened();
             }
 
             if (_configuration != IntPtr.Zero)
@@ -101,6 +147,40 @@ namespace Nucleus.Integrations.Unity.Transports
         }
 
         /// <summary>
+        /// Closes every accepted connection that has not opened its session within the connecting timeout.
+        /// </summary>
+        /// <remarks>
+        /// Called once a frame on the network loop thread. Without it, a peer that completes its handshake and never sends its CONNECT is
+        /// held for good, the server's own keep-alives refreshing the idle timeout. A frame with nothing overdue costs a timestamp, the lock
+        /// and a peek.
+        /// </remarks>
+        internal void CloseLateSessions()
+        {
+            long nowTimestamp = Stopwatch.GetTimestamp();
+
+            while (true)
+            {
+                QuicSession lateSession;
+
+                lock (_acceptedSessionsLock)
+                {
+                    if (_acceptedSessions.Count == 0 || _acceptedSessions.Peek().OpenByTimestamp > nowTimestamp)
+                        return;
+
+                    lateSession = _acceptedSessions.Dequeue().Session;
+                }
+
+                lateSession.CloseUnlessOpened();
+            }
+        }
+
+        /// <summary>
+        /// Stops counting a session against <see cref="_maximumSessionCount"/>, once MsQuic has released its connection.
+        /// </summary>
+        /// <remarks>Called on an MsQuic worker thread, possibly after the listener has stopped.</remarks>
+        internal void NotifySessionReleased() => Interlocked.Decrement(ref _sessionCount);
+
+        /// <summary>
         /// Opens a configuration with the server's certificate and starts listening.
         /// </summary>
         /// <param name="msQuic">The MsQuic copy to listen with.</param>
@@ -109,12 +189,13 @@ namespace Nucleus.Integrations.Unity.Transports
         /// <param name="certificatePassword">The password protecting <paramref name="certificate"/>, or empty for none.</param>
         /// <param name="bindAddress">The local address to listen on, or empty for every interface.</param>
         /// <param name="port">The port to listen on.</param>
-        /// <param name="connectingTimeoutSeconds">How long a handshake may go unanswered; zero uses <paramref name="connectedTimeoutSeconds"/>.</param>
+        /// <param name="connectingTimeoutSeconds">How long a handshake may go unanswered, and how long an accepted connection has to open its session; zero uses <paramref name="connectedTimeoutSeconds"/>.</param>
         /// <param name="connectedTimeoutSeconds">How long a connection may go unanswered.</param>
         /// <param name="maximumReliablePacketSize">The largest reliable packet a client may send.</param>
+        /// <param name="maximumConnections">The most clients the server admits, or <see cref="ServerConfiguration.UnsetMaximumConnections"/> for any number.</param>
         /// <param name="quicListener">The listener, or <see langword="null"/> when it could not be started.</param>
         /// <returns>True when the server is listening.</returns>
-        internal static bool TryStart(MsQuic msQuic, WebTransportEvents events, byte[] certificate, string certificatePassword, string bindAddress, ushort port, ushort connectingTimeoutSeconds, ushort connectedTimeoutSeconds, int maximumReliablePacketSize, out QuicListener quicListener)
+        internal static bool TryStart(MsQuic msQuic, WebTransportEvents events, byte[] certificate, string certificatePassword, string bindAddress, ushort port, ushort connectingTimeoutSeconds, ushort connectedTimeoutSeconds, int maximumReliablePacketSize, uint maximumConnections, out QuicListener quicListener)
         {
             quicListener = null;
 
@@ -125,8 +206,8 @@ namespace Nucleus.Integrations.Unity.Transports
                 return false;
             }
 
-            QuicListener startingQuicListener = new(msQuic, events, maximumReliablePacketSize);
             MsQuic.Settings settings = CreateSettings(connectingTimeoutSeconds, connectedTimeoutSeconds, PeerBidirectionalStreamCount, PeerUnidirectionalStreamCount);
+            QuicListener startingQuicListener = new(msQuic, events, maximumReliablePacketSize, maximumConnections, settings.HandshakeIdleTimeoutMilliseconds);
 
             if (!TryOpenConfiguration(msQuic, ref settings, out startingQuicListener._configuration))
             {
@@ -263,6 +344,34 @@ namespace Nucleus.Integrations.Unity.Transports
         }
 
         /// <summary>
+        /// Takes up a new connection, unless the listener already holds as many sessions as it allows.
+        /// </summary>
+        /// <param name="connection">The new connection.</param>
+        /// <param name="newConnectionInfo">Its details.</param>
+        /// <returns>The status MsQuic is answered with; a failure refuses the connection.</returns>
+        /// <remarks>
+        /// The count is read rather than reserved, so connections accepted at the same moment on several MsQuic threads can pass the bound
+        /// by one a thread: it caps what a flood can hold rather than counting exactly. A refusal is not logged, so a flood writes no log.
+        /// </remarks>
+        private int Accept(IntPtr connection, MsQuic.NewConnectionInfo* newConnectionInfo)
+        {
+            if (_maximumSessionCount is not UnsetMaximumSessionCount && Volatile.Read(ref _sessionCount) >= _maximumSessionCount)
+                return _msQuic.GetInternalErrorStatus();
+
+            int acceptStatus = QuicSession.Accept(_msQuic, _events, this, connection, _configuration, ReadAddress(newConnectionInfo->RemoteAddress), _maximumReliablePacketSize, out QuicSession quicSession);
+
+            if (!_msQuic.IsSucceeded(acceptStatus))
+                return acceptStatus;
+
+            Interlocked.Increment(ref _sessionCount);
+
+            lock (_acceptedSessionsLock)
+                _acceptedSessions.Enqueue((quicSession, Stopwatch.GetTimestamp() + _connectingTimeoutStopwatchTicks));
+
+            return acceptStatus;
+        }
+
+        /// <summary>
         /// Builds the native address to listen on.
         /// </summary>
         /// <param name="msQuic">The MsQuic copy, which knows the platform's IPv6 family number.</param>
@@ -331,9 +440,7 @@ namespace Nucleus.Integrations.Unity.Transports
 
             try
             {
-                string remoteAddress = ReadAddress(listenerEvent->NewConnectionInfo->RemoteAddress);
-
-                return QuicSession.Accept(quicListener._msQuic, quicListener._events, listenerEvent->NewConnection, quicListener._configuration, remoteAddress, quicListener._maximumReliablePacketSize);
+                return quicListener.Accept(listenerEvent->NewConnection, listenerEvent->NewConnectionInfo);
             }
             catch (Exception exception)
             {
