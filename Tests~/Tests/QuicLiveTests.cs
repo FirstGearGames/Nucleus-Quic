@@ -23,7 +23,7 @@ namespace Nucleus.Integrations.Unity.Transports.Tests;
 /// Authentication alone proves little, so each case asserts what crossed the wire: a message each way on each channel, a reliable message
 /// many datagrams long, the address the server recorded, and the client's link dropping when the server kicks it.
 /// </remarks>
-public class QuicLiveTests
+public partial class QuicLiveTests
 {
     /// <summary>
     /// Attempts allowed for any one settle.
@@ -215,11 +215,23 @@ public class QuicLiveTests
     /// <returns>The server and its transport.</returns>
     private static async Task<(CoreManager, Quic)> StartServerAsync(ushort port)
     {
+        (CoreManager server, Quic serverTransport) = await CreateServerAsync(port);
+
+        Assert.Equal(ConnectionStateChangeResult.Success, await serverTransport.ConnectAsync(Invoker.Server));
+
+        return (server, serverTransport);
+    }
+
+    /// <summary>
+    /// Creates a server on a port without starting it, so a test can configure it first.
+    /// </summary>
+    /// <param name="port">The UDP port.</param>
+    /// <returns>The server and its transport.</returns>
+    private static async Task<(CoreManager, Quic)> CreateServerAsync(ushort port)
+    {
         CoreManager server = CreateManager();
         Quic serverTransport = (Quic)await server.TransportManager.AddTransportAsync<Quic>();
         serverTransport.SetPort(port);
-
-        Assert.Equal(ConnectionStateChangeResult.Success, await serverTransport.ConnectAsync(Invoker.Server));
 
         return (server, serverTransport);
     }

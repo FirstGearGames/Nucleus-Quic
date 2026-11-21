@@ -37,9 +37,13 @@ namespace Nucleus.Integrations.Unity.Transports
         /// </summary>
         private readonly WebTransportEvents _events = new();
         /// <summary>
-        /// Clients this server dropped, whose departure is told to the engine on the next receive pass.
+        /// Clients this server dropped or whose sessions closed, whose departure the receive pass tells the engine once it has admitted every
+        /// session that opened in it.
         /// </summary>
-        /// <remarks>Held for the pass rather than told at once, so a drop requested from inside the engine never changes its roster under it.</remarks>
+        /// <remarks>
+        /// Held for the pass rather than told at once, so a drop requested from inside the engine never changes its roster under it, and
+        /// held past the pass's admissions, so a departed Connection is never back in its pool while a newcomer is being given one.
+        /// </remarks>
         private readonly Queue<Connection> _droppedConnections = new();
 #if !UNITY_WEBGL || UNITY_EDITOR
         /// <summary>
@@ -307,14 +311,12 @@ namespace Nucleus.Integrations.Unity.Transports
 
         /// <inheritdoc/>
         /// <remarks>
-        /// Called by the network loop, which is Unity's main thread under Unity. Every event MsQuic queued since the last pass is applied in
-        /// the order it happened, so a client's first packets always find it registered.
+        /// Called by the network loop, which is Unity's main thread under Unity. Every session opening and every packet MsQuic queued since
+        /// the last pass is applied in the order it happened, so a client's first packets always find it registered. Departures are told
+        /// after them, for the reason <see cref="_droppedConnections"/> records.
         /// </remarks>
         protected override void ReceivePackets(ref List<IncomingPacket> receivedPackets)
         {
-            while (_droppedConnections.TryDequeue(out Connection droppedConnection))
-                NotifyDisconnected(droppedConnection, droppedConnection.IdBySocket);
-
             while (_events.TryDequeue(out WebTransportEvent webTransportEvent))
             {
                 WebTransportSession webTransportSession = webTransportEvent.Session;
@@ -336,12 +338,19 @@ namespace Nucleus.Integrations.Unity.Transports
                         if (webTransportSession.NucleusConnection is { } departedConnection)
                         {
                             Forget(webTransportSession);
-                            NotifyDisconnected(departedConnection, departedConnection.IdBySocket);
+                            _droppedConnections.Enqueue(departedConnection);
                         }
 
                         break;
                 }
             }
+
+            /* Told only now that every session which opened this pass has been admitted. A departure returns its Connection to a pool that
+             * hands the same instance to the next client admitted, while the packets the departed client sent earlier in this pass still name
+             * it as their sender, so they would be read as the newcomer's. Told here, that Connection is no longer Connected when the engine
+             * reads them, and they are dropped. */
+            while (_droppedConnections.TryDequeue(out Connection droppedConnection))
+                NotifyDisconnected(droppedConnection, droppedConnection.IdBySocket);
 
             /* What this transport's own client half handed over in process, treated from here on exactly as a packet off the network. Each
              * payload array belongs to the Reader the engine initializes with it. */
