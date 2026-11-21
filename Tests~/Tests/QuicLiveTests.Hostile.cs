@@ -8,6 +8,7 @@ using System.Reflection;
 using System.Runtime.Versioning;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using System.Threading.Tasks;
 using Nucleus.Connections;
 using Nucleus.Managers.Core;
@@ -136,10 +137,61 @@ public partial class QuicLiveTests
     }
 
     /// <summary>
+    /// A CONNECT that does not ask for WebTransport, naming no protocol or another one, is refused rather than taken as a session.
+    /// </summary>
+    /// <param name="protocol">The <c>:protocol</c> the request names, or empty to name none.</param>
+    [Theory(Timeout = 60000)]
+    [InlineData("")]
+    [InlineData("connect-udp")]
+    public async Task LiveWebTransport_AConnectNotAskingForWebTransport_IsRefused(string protocol)
+    {
+        ushort port = ProbeFreeUdpPort();
+        (_, Quic serverTransport) = await StartServerAsync(port);
+
+        await using QuicConnection hostileConnection = await ConnectRawClientAsync(port);
+        await using QuicStream requestStream = await hostileConnection.OpenOutboundStreamAsync(QuicStreamType.Bidirectional);
+
+        await requestStream.WriteAsync(CreateConnectRequestFrame(protocol.Length == 0 ? [] : CreatePlainProtocolFieldLine(protocol)));
+
+        Assert.False(await IsConnectAcceptedAsync(requestStream), $"The server accepted a CONNECT naming the protocol [{protocol}] as a WebTransport session.");
+
+        await hostileConnection.CloseAsync(NoErrorCode);
+        await serverTransport.ShutdownAsync();
+    }
+
+    /// <summary>
+    /// A CONNECT naming the WebTransport protocol with its field name and value Huffman coded, as a browser's QPACK encoder writes them
+    /// because that is shorter, is accepted.
+    /// </summary>
+    [Fact(Timeout = 60000)]
+    public async Task LiveWebTransport_AConnectWithAHuffmanCodedProtocol_IsAccepted()
+    {
+        ushort port = ProbeFreeUdpPort();
+        (_, Quic serverTransport) = await StartServerAsync(port);
+
+        await using QuicConnection quicConnection = await ConnectRawClientAsync(port);
+        await using QuicStream requestStream = await quicConnection.OpenOutboundStreamAsync(QuicStreamType.Bidirectional);
+
+        // A literal name with the Huffman bit, its length seven, and :protocol; then a Huffman value nine long, webtransport.
+        byte[] huffmanProtocolFieldLine = [0x2F, 0x00, 0xB9, 0x5D, 0x87, 0x49, 0xC8, 0x7A, 0x3F, 0x89, 0xF0, 0x58, 0xD3, 0x60, 0xEA, 0x45, 0x67, 0xB1, 0x3F];
+
+        await requestStream.WriteAsync(CreateConnectRequestFrame(huffmanProtocolFieldLine));
+
+        Assert.True(await IsConnectAcceptedAsync(requestStream), "The server refused a CONNECT whose :protocol webtransport was Huffman coded.");
+
+        await quicConnection.CloseAsync(NoErrorCode);
+        await serverTransport.ShutdownAsync();
+    }
+
+    /// <summary>
     /// Opens a bare QUIC connection to a local server, offering HTTP/3 and doing nothing more, for a test to play a hostile client.
     /// </summary>
     /// <param name="port">The server's port.</param>
     /// <returns>The connection, its handshake complete.</returns>
+    /// <remarks>
+    /// A test closes it before stopping the server while it is still open: a stream left open is otherwise disposed by waiting out the idle
+    /// timeout for an acknowledgment a stopped server never sends.
+    /// </remarks>
     private static ValueTask<QuicConnection> ConnectRawClientAsync(ushort port) => QuicConnection.ConnectAsync(new()
     {
         RemoteEndPoint = new IPEndPoint(IPAddress.Loopback, port),
@@ -207,6 +259,61 @@ public partial class QuicLiveTests
             if (quicStream.Type is QuicStreamType.Bidirectional)
                 return quicStream;
         }
+    }
+
+    /// <summary>
+    /// Builds a CONNECT request's HEADERS frame as a browser lays one out: <c>:method CONNECT</c> and <c>:scheme https</c> as static
+    /// entries, <c>:authority</c> and <c>:path</c> as static names with plain values, then the protocol field line given.
+    /// </summary>
+    /// <param name="protocolFieldLine">The encoded <c>:protocol</c> field line, or empty for none.</param>
+    /// <returns>The frame.</returns>
+    private static byte[] CreateConnectRequestFrame(byte[] protocolFieldLine)
+    {
+        byte[] authority = Encoding.ASCII.GetBytes("localhost:7777");
+        List<byte> fieldSection = [0x00, 0x00, 0xCF, 0xD7, 0x50, (byte)authority.Length, .. authority, 0x51, 0x01, (byte)'/', .. protocolFieldLine];
+
+        Assert.True(fieldSection.Count < 64, "The field section must fit a one-byte length.");
+
+        return [0x01, (byte)fieldSection.Count, .. fieldSection];
+    }
+
+    /// <summary>
+    /// Encodes a <c>:protocol</c> field line with a plain literal name and value, as this transport's own client writes it.
+    /// </summary>
+    /// <param name="protocol">The protocol named, shorter than 127 characters.</param>
+    /// <returns>The field line.</returns>
+    private static byte[] CreatePlainProtocolFieldLine(string protocol) => [0x27, 0x02, .. Encoding.ASCII.GetBytes(":protocol"), (byte)protocol.Length, .. Encoding.ASCII.GetBytes(protocol)];
+
+    /// <summary>
+    /// Reads what a server answers a CONNECT with.
+    /// </summary>
+    /// <param name="requestStream">The stream the CONNECT was sent on.</param>
+    /// <returns>True when the server answered with <c>:status 200</c>; false when it refused the request or closed the stream.</returns>
+    /// <remarks>This transport's server answers with a field section whose first line is <c>:status 200</c> as a static entry, so that is all that is read.</remarks>
+    private static async Task<bool> IsConnectAcceptedAsync(QuicStream requestStream)
+    {
+        byte[] response = new byte[64];
+        int responseLength = 0;
+
+        try
+        {
+            // The frame type, a one-byte length, and the field section's two prefix bytes come before the status.
+            while (responseLength < 5)
+            {
+                int readLength = await requestStream.ReadAsync(response.AsMemory(responseLength));
+
+                if (readLength == 0)
+                    return false;
+
+                responseLength += readLength;
+            }
+        }
+        catch (QuicException)
+        {
+            return false;
+        }
+
+        return response[0] == 0x01 && response[4] == 0xD9;
     }
 
     /// <summary>

@@ -514,7 +514,7 @@ namespace Nucleus.Integrations.Unity.Transports
         }
 
         /// <summary>
-        /// Reads a client's CONNECT once its headers are in, accepting the first and refusing anything else.
+        /// Reads a client's CONNECT once its headers are in, accepting the first that asks for WebTransport and refusing anything else.
         /// </summary>
         /// <param name="stream">The request stream.</param>
         /// <param name="quicStream">What is kept about it.</param>
@@ -530,7 +530,7 @@ namespace Nucleus.Integrations.Unity.Transports
                 return;
             }
 
-            if (_sessionId != UnsetStreamId || !Http3.IsConnectRequest(quicStream.Buffer, fieldSectionOffset, fieldSectionEnd))
+            if (_sessionId != UnsetStreamId || !Http3.IsWebTransportConnectRequest(quicStream.Buffer, fieldSectionOffset, fieldSectionEnd))
             {
                 RefuseRequest(stream, quicStream);
 

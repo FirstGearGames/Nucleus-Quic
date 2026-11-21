@@ -12,8 +12,9 @@ namespace Nucleus.Integrations.Unity.Transports
     /// <para>
     /// Only what one session per connection needs is spoken. Header blocks are QPACK with the static table alone, which the SETTINGS
     /// advertise by leaving the dynamic table at its default size of zero, so a peer may only refer to static entries or send literals.
-    /// Literals this side writes are never Huffman coded, and literals a peer writes are skipped rather than decoded: the only facts read
-    /// from a header block are the method of a request and the status of a response, which every browser sends as static entries.
+    /// Literals this side writes are never Huffman coded, and literals a peer writes are compared rather than decoded: the only facts read
+    /// from a header block are the method and protocol of a request and the status of a response. Every browser sends the method and the
+    /// status as static entries; the protocol has no entry, so it is compared against both its plain and its Huffman coding.
     /// </para>
     /// <para>
     /// Draft 02 of WebTransport over HTTP/3, which Chrome and Firefox speak, and drafts 07 onwards, which Safari speaks, are both offered.
@@ -38,6 +39,22 @@ namespace Nucleus.Integrations.Unity.Transports
         /// The most bytes a variable-length integer takes.
         /// </summary>
         internal const int MaximumVariableLengthIntegerSize = 8;
+        /// <summary>
+        /// <see cref="ProtocolFieldName"/> Huffman coded, as a QPACK encoder writes it because that is shorter.
+        /// </summary>
+        private static ReadOnlySpan<byte> HuffmanCodedProtocolFieldName => new byte[] { 0xB9, 0x5D, 0x87, 0x49, 0xC8, 0x7A, 0x3F };
+        /// <summary>
+        /// <see cref="WebTransportProtocol"/> Huffman coded, as a QPACK encoder writes it because that is shorter.
+        /// </summary>
+        private static ReadOnlySpan<byte> HuffmanCodedWebTransportProtocol => new byte[] { 0xF0, 0x58, 0xD3, 0x60, 0xEA, 0x45, 0x67, 0xB1, 0x3F };
+        /// <summary>
+        /// The field an extended CONNECT names its protocol in, which no QPACK static table entry names.
+        /// </summary>
+        private const string ProtocolFieldName = ":protocol";
+        /// <summary>
+        /// The protocol a CONNECT opening a WebTransport session names.
+        /// </summary>
+        private const string WebTransportProtocol = "webtransport";
         /// <summary>
         /// The HEADERS frame type.
         /// </summary>
@@ -324,13 +341,14 @@ namespace Nucleus.Integrations.Unity.Transports
         }
 
         /// <summary>
-        /// Returns whether a request's field section asks for <c>:method CONNECT</c>.
+        /// Returns whether a request's field section is the extended CONNECT that opens a WebTransport session: <c>:method CONNECT</c> with
+        /// <c>:protocol webtransport</c>.
         /// </summary>
         /// <param name="source">The bytes holding the field section.</param>
         /// <param name="offset">Where the field section starts.</param>
         /// <param name="end">Where it ends.</param>
-        /// <returns>True for a CONNECT request.</returns>
-        internal static bool IsConnectRequest(byte[] source, int offset, int end) => HasField(source, offset, end, MethodConnectStaticIndex, FirstMethodStaticIndex, LastMethodStaticIndex, "CONNECT");
+        /// <returns>True for a WebTransport CONNECT request.</returns>
+        internal static bool IsWebTransportConnectRequest(byte[] source, int offset, int end) => HasField(source, offset, end, MethodConnectStaticIndex, FirstMethodStaticIndex, LastMethodStaticIndex, "CONNECT") && HasWebTransportProtocol(source, offset, end);
 
         /// <summary>
         /// Returns whether a response's field section carries <c>:status 200</c>.
@@ -561,6 +579,84 @@ namespace Nucleus.Integrations.Unity.Transports
 
             return false;
         }
+
+        /// <summary>
+        /// Returns whether a request's field section holds <c>:protocol webtransport</c>, its name and its value each plain or Huffman coded.
+        /// </summary>
+        /// <param name="source">The bytes holding the field section.</param>
+        /// <param name="offset">Where the field section starts.</param>
+        /// <param name="end">Where it ends.</param>
+        /// <returns>True when the field is there.</returns>
+        /// <remarks>
+        /// Deliberately parallel to <see cref="HasField"/>, which finds a field by its static table entry: this field has none, so it arrives
+        /// as a literal name, the one line form that method only steps over. A field section that refers to the dynamic table is refused, as
+        /// there.
+        /// </remarks>
+        private static bool HasWebTransportProtocol(byte[] source, int offset, int end)
+        {
+            if (!TryReadPrefixedInteger(source, ref offset, end, prefixBits: 8, out ulong requiredInsertCount) || requiredInsertCount != 0 || !TryReadPrefixedInteger(source, ref offset, end, prefixBits: 7, out _))
+                return false;
+
+            while (offset < end)
+            {
+                byte first = source[offset];
+
+                // An indexed field line, which carries no literal.
+                if ((first & 0x80) != 0)
+                {
+                    if (!TryReadPrefixedInteger(source, ref offset, end, prefixBits: 6, out _))
+                        return false;
+
+                    continue;
+                }
+
+                // A literal field line with a name reference, whose name is a table entry rather than a literal.
+                if ((first & 0x40) != 0)
+                {
+                    if (!TryReadPrefixedInteger(source, ref offset, end, prefixBits: 4, out _) || !TrySkipStringLiteral(source, ref offset, end, out _, out _, out _))
+                        return false;
+
+                    continue;
+                }
+
+                // A literal field line with a literal name: 001, never-indexed, Huffman, then a 3-bit name length.
+                if ((first & 0x20) != 0)
+                {
+                    bool isNameHuffmanCoded = (first & 0x08) != 0;
+
+                    if (!TryReadPrefixedInteger(source, ref offset, end, prefixBits: 3, out ulong nameLength) || (ulong)(end - offset) < nameLength)
+                        return false;
+
+                    int nameOffset = offset;
+                    offset += (int)nameLength;
+
+                    if (!TrySkipStringLiteral(source, ref offset, end, out int valueOffset, out int valueLength, out bool isValueHuffmanCoded))
+                        return false;
+
+                    if (IsStringLiteral(source, nameOffset, (int)nameLength, isNameHuffmanCoded, ProtocolFieldName, HuffmanCodedProtocolFieldName) && IsStringLiteral(source, valueOffset, valueLength, isValueHuffmanCoded, WebTransportProtocol, HuffmanCodedWebTransportProtocol))
+                        return true;
+
+                    continue;
+                }
+
+                // Both remaining forms refer to the dynamic table, which this endpoint advertised none of.
+                return false;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Returns whether a string literal spells a value, read as plain ASCII or compared against the value's Huffman coding.
+        /// </summary>
+        /// <param name="source">The bytes holding the literal.</param>
+        /// <param name="offset">Where the literal's bytes start.</param>
+        /// <param name="length">How many bytes it holds.</param>
+        /// <param name="isHuffmanCoded">Whether the bytes are Huffman coded.</param>
+        /// <param name="value">The value, as ASCII.</param>
+        /// <param name="huffmanCodedValue">The value Huffman coded; a string has exactly one Huffman coding, so the bytes are compared as they are.</param>
+        /// <returns>True when they match.</returns>
+        private static bool IsStringLiteral(byte[] source, int offset, int length, bool isHuffmanCoded, string value, ReadOnlySpan<byte> huffmanCodedValue) => isHuffmanCoded ? source.AsSpan(offset, length).SequenceEqual(huffmanCodedValue) : IsAscii(source, offset, length, value);
 
         /// <summary>
         /// Returns whether a run of bytes spells an ASCII string exactly.
