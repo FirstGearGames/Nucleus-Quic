@@ -7,6 +7,7 @@ using System.Net.Quic;
 using System.Net.Security;
 using System.Reflection;
 using System.Runtime.Versioning;
+using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -147,6 +148,72 @@ public partial class QuicLiveTests
         await DriveUntilAsync(client, client, () => clientTransport.ClientSocket.State is LocalConnectionState.Disconnected, () => $"The client is still [{clientTransport.ClientSocket.State}] after the server sent [{HostileByteBudget}] bytes of headers that never ended, and the flood was cut off: [{isFloodCutOff}].");
 
         await clientTransport.ShutdownAsync();
+    }
+
+    /// <summary>
+    /// A client pinning the hash of a certificate that has expired is refused at the handshake, as a browser refuses it, rather than
+    /// trusting the hash alone.
+    /// </summary>
+    [Fact(Timeout = 60000)]
+    public async Task LiveWebTransport_AClientPinningAnExpiredCertificate_IsRefused()
+    {
+        using X509Certificate2 certificate = CreateRawServerCertificate(DateTimeOffset.UtcNow.AddDays(-20), DateTimeOffset.UtcNow.AddDays(-7));
+        await using QuicListener hostileListener = await ListenRawServerAsync(certificate);
+        Task<(QuicConnection Connection, QuicStream ConnectStream)?> answeringTask = AcceptAndAnswerConnectAsync(hostileListener);
+        (CoreManager client, Quic clientTransport) = await ConnectClientAsync((ushort)hostileListener.LocalEndPoint.Port, Convert.ToHexString(SHA256.HashData(certificate.RawData)));
+
+        await DriveUntilAsync(client, client, () => clientTransport.ClientSocket.State is LocalConnectionState.Connected or LocalConnectionState.Disconnected);
+
+        LocalConnectionState clientState = clientTransport.ClientSocket.State;
+
+        await clientTransport.ShutdownAsync();
+        await DisposeAnsweredConnectionAsync(answeringTask);
+
+        Assert.True(clientState is LocalConnectionState.Disconnected, $"The client reached [{clientState}] with a server whose pinned certificate expired a week ago.");
+    }
+
+    /// <summary>
+    /// A client pinning the hash of a certificate valid past 2050, whose expiry is written as a GeneralizedTime rather than a UTCTime,
+    /// connects: only a certificate outside the period it is valid for is refused.
+    /// </summary>
+    [Fact(Timeout = 60000)]
+    public async Task LiveWebTransport_AClientPinningACertificateValidPast2050_Connects()
+    {
+        using X509Certificate2 certificate = CreateRawServerCertificate(DateTimeOffset.UtcNow.AddHours(-1), new DateTimeOffset(2051, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        await using QuicListener hostileListener = await ListenRawServerAsync(certificate);
+        Task<(QuicConnection Connection, QuicStream ConnectStream)?> answeringTask = AcceptAndAnswerConnectAsync(hostileListener);
+        (CoreManager client, Quic clientTransport) = await ConnectClientAsync((ushort)hostileListener.LocalEndPoint.Port, Convert.ToHexString(SHA256.HashData(certificate.RawData)));
+
+        await DriveUntilAsync(client, client, () => clientTransport.ClientSocket.State is LocalConnectionState.Connected or LocalConnectionState.Disconnected);
+
+        LocalConnectionState clientState = clientTransport.ClientSocket.State;
+
+        await clientTransport.ShutdownAsync();
+        await DisposeAnsweredConnectionAsync(answeringTask);
+
+        Assert.True(clientState is LocalConnectionState.Connected, $"The client reached [{clientState}] with a server whose pinned certificate is valid until 2051.");
+    }
+
+    /// <summary>
+    /// A client pinning the hash of a certificate valid for longer than the two weeks a browser allows such a certificate is refused, as a
+    /// browser refuses it.
+    /// </summary>
+    [Fact(Timeout = 60000, Skip = "Held for Ben: refusing a pinned certificate valid for more than 14 days breaks a native-only game pinning a long-lived certificate file.")]
+    public async Task LiveWebTransport_AClientPinningACertificateValidForAMonth_IsRefused()
+    {
+        using X509Certificate2 certificate = CreateRawServerCertificate(DateTimeOffset.UtcNow.AddHours(-1), DateTimeOffset.UtcNow.AddDays(30));
+        await using QuicListener hostileListener = await ListenRawServerAsync(certificate);
+        Task<(QuicConnection Connection, QuicStream ConnectStream)?> answeringTask = AcceptAndAnswerConnectAsync(hostileListener);
+        (CoreManager client, Quic clientTransport) = await ConnectClientAsync((ushort)hostileListener.LocalEndPoint.Port, Convert.ToHexString(SHA256.HashData(certificate.RawData)));
+
+        await DriveUntilAsync(client, client, () => clientTransport.ClientSocket.State is LocalConnectionState.Connected or LocalConnectionState.Disconnected);
+
+        LocalConnectionState clientState = clientTransport.ClientSocket.State;
+
+        await clientTransport.ShutdownAsync();
+        await DisposeAnsweredConnectionAsync(answeringTask);
+
+        Assert.True(clientState is LocalConnectionState.Disconnected, $"The client reached [{clientState}] with a server whose pinned certificate is valid for 30 days.");
     }
 
     /// <summary>
@@ -422,6 +489,44 @@ public partial class QuicLiveTests
         using X509Certificate2 ephemeralCertificate = certificateRequest.CreateSelfSigned(notBefore, notAfter);
 
         return X509CertificateLoader.LoadPkcs12(ephemeralCertificate.Export(X509ContentType.Pfx), password: null);
+    }
+
+    /// <summary>
+    /// Accepts one connection and answers its CONNECT with <c>:status 200</c>, as a WebTransport server does, leaving both open.
+    /// </summary>
+    /// <param name="quicListener">The listener.</param>
+    /// <returns>The connection and its CONNECT stream, or <see langword="null"/> when the handshake failed or the listener was disposed first.</returns>
+    private static async Task<(QuicConnection Connection, QuicStream ConnectStream)?> AcceptAndAnswerConnectAsync(QuicListener quicListener)
+    {
+        try
+        {
+            QuicConnection quicConnection = await quicListener.AcceptConnectionAsync();
+            QuicStream connectStream = await AcceptBidirectionalStreamAsync(quicConnection);
+
+            await connectStream.ReadAtLeastAsync(new byte[256], minimumBytes: 1, throwOnEndOfStream: false);
+
+            // A HEADERS frame three bytes long: the field section's two prefix bytes, then :status 200 as a static entry.
+            await connectStream.WriteAsync(new byte[] { 0x01, 0x03, 0x00, 0x00, 0xD9 });
+
+            return (quicConnection, connectStream);
+        }
+        catch (Exception exception) when (exception is QuicException or AuthenticationException or ObjectDisposedException or OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Closes whatever <see cref="AcceptAndAnswerConnectAsync"/> left open, without waiting on a handshake that never came.
+    /// </summary>
+    /// <param name="answeringTask">The task answering the CONNECT.</param>
+    private static async Task DisposeAnsweredConnectionAsync(Task<(QuicConnection Connection, QuicStream ConnectStream)?> answeringTask)
+    {
+        if (!answeringTask.IsCompletedSuccessfully || answeringTask.Result is not { } answeredConnection)
+            return;
+
+        await answeredConnection.ConnectStream.DisposeAsync();
+        await answeredConnection.Connection.DisposeAsync();
     }
 
     /// <summary>

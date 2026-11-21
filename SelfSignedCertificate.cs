@@ -92,6 +92,22 @@ namespace Nucleus.Integrations.Unity.Transports
         /// How many times the PKCS #12 MAC key derivation hashes.
         /// </summary>
         private const int MacIterationCount = 2048;
+        /// <summary>
+        /// The DER tag of a SEQUENCE.
+        /// </summary>
+        private const byte SequenceTag = 0x30;
+        /// <summary>
+        /// The DER tag of a certificate's explicit <c>[0]</c> version.
+        /// </summary>
+        private const byte ExplicitVersionTag = 0xA0;
+        /// <summary>
+        /// The DER tag of a UTCTime.
+        /// </summary>
+        private const byte UtcTimeTag = 0x17;
+        /// <summary>
+        /// The DER tag of a GeneralizedTime.
+        /// </summary>
+        private const byte GeneralizedTimeTag = 0x18;
 
         /// <summary>
         /// Makes a certificate valid from a little before now for <see cref="ValidityPeriod"/>.
@@ -210,6 +226,45 @@ namespace Nucleus.Integrations.Unity.Transports
             certificateHash = hashBytes.ToArray();
 
             return true;
+        }
+
+        /// <summary>
+        /// Reads when a DER-encoded X.509 certificate becomes valid and when it expires.
+        /// </summary>
+        /// <param name="certificate">The certificate, as the peer sent it.</param>
+        /// <param name="notBefore">When it becomes valid, in UTC.</param>
+        /// <param name="notAfter">When it expires, in UTC.</param>
+        /// <returns>True when both times were read; false for bytes that are not a certificate laid out as RFC 5280 sets out.</returns>
+        /// <remarks>Every length is checked against what encloses it, because the bytes come from the peer.</remarks>
+        internal static bool TryReadValidity(byte[] certificate, out DateTime notBefore, out DateTime notAfter)
+        {
+            notBefore = default;
+            notAfter = default;
+
+            int offset = 0;
+
+            // Into the certificate, then into the part that was signed.
+            if (!TryReadElementHeader(certificate, ref offset, certificate.Length, out byte certificateTag, out int certificateEnd) || certificateTag != SequenceTag)
+                return false;
+
+            if (!TryReadElementHeader(certificate, ref offset, certificateEnd, out byte toBeSignedTag, out int toBeSignedEnd) || toBeSignedTag != SequenceTag)
+                return false;
+
+            // Past the version, which is optional, the serial number, the signature algorithm and the issuer.
+            int skippedElementCount = offset < toBeSignedEnd && certificate[offset] == ExplicitVersionTag ? 4 : 3;
+
+            for (int i = 0; i < skippedElementCount; i++)
+            {
+                if (!TryReadElementHeader(certificate, ref offset, toBeSignedEnd, out _, out int skippedElementEnd))
+                    return false;
+
+                offset = skippedElementEnd;
+            }
+
+            if (!TryReadElementHeader(certificate, ref offset, toBeSignedEnd, out byte validityTag, out int validityEnd) || validityTag != SequenceTag)
+                return false;
+
+            return TryReadTime(certificate, ref offset, validityEnd, out notBefore) && TryReadTime(certificate, ref offset, validityEnd, out notAfter);
         }
 
         /// <summary>
@@ -481,6 +536,113 @@ namespace Nucleus.Integrations.Unity.Transports
             byte[] length = content.Length < 0x80 ? new[] { (byte)content.Length } : content.Length <= 0xFF ? new byte[] { 0x81, (byte)content.Length } : new byte[] { 0x82, (byte)(content.Length >> 8), (byte)content.Length };
 
             return Concatenate(new[] { tag }, length, content);
+        }
+
+        /// <summary>
+        /// Reads a DER element's tag and length, leaving the offset at its content.
+        /// </summary>
+        /// <param name="source">The bytes.</param>
+        /// <param name="offset">Where the element starts, moved to where its content starts.</param>
+        /// <param name="end">Where the content of the element enclosing it ends.</param>
+        /// <param name="tag">The element's tag.</param>
+        /// <param name="contentEnd">Where the element's content ends.</param>
+        /// <returns>True when the header was whole and the content fits inside what encloses it.</returns>
+        /// <remarks>Only the single-byte tags and the lengths of up to three bytes a certificate uses are read.</remarks>
+        private static bool TryReadElementHeader(byte[] source, ref int offset, int end, out byte tag, out int contentEnd)
+        {
+            tag = 0;
+            contentEnd = 0;
+
+            if (end - offset < 2)
+                return false;
+
+            tag = source[offset++];
+            int length = source[offset++];
+
+            // A long-form length, whose low bits count the length bytes that follow.
+            if (length >= 0x80)
+            {
+                int lengthByteCount = length & 0x7F;
+
+                if (lengthByteCount is 0 or > 3 || end - offset < lengthByteCount)
+                    return false;
+
+                length = 0;
+
+                for (int i = 0; i < lengthByteCount; i++)
+                    length = length << 8 | source[offset++];
+            }
+
+            if (end - offset < length)
+                return false;
+
+            contentEnd = offset + length;
+
+            return true;
+        }
+
+        /// <summary>
+        /// Reads a certificate time: a UTCTime, whose two-digit year RFC 5280 reads as 1950 to 2049, or a GeneralizedTime.
+        /// </summary>
+        /// <param name="source">The bytes.</param>
+        /// <param name="offset">Where the element starts, moved past it.</param>
+        /// <param name="end">Where the content of the element enclosing it ends.</param>
+        /// <param name="time">The time, in UTC.</param>
+        /// <returns>True for a whole time in the form with seconds and Z that RFC 5280 requires.</returns>
+        /// <remarks>Read digit by digit rather than parsed against a format, so no runtime's own two-digit year window plays a part.</remarks>
+        private static bool TryReadTime(byte[] source, ref int offset, int end, out DateTime time)
+        {
+            time = default;
+
+            if (!TryReadElementHeader(source, ref offset, end, out byte tag, out int timeEnd))
+                return false;
+
+            int digitOffset = offset;
+            int yearDigitCount = tag == UtcTimeTag ? 2 : tag == GeneralizedTimeTag ? 4 : 0;
+
+            offset = timeEnd;
+
+            // The year, then the month, day, hour, minute and second at two digits each, then Z.
+            if (yearDigitCount == 0 || timeEnd - digitOffset != yearDigitCount + 11 || source[timeEnd - 1] != (byte)'Z')
+                return false;
+
+            if (!TryReadDigits(source, ref digitOffset, yearDigitCount, out int year) || !TryReadDigits(source, ref digitOffset, 2, out int month) || !TryReadDigits(source, ref digitOffset, 2, out int day) || !TryReadDigits(source, ref digitOffset, 2, out int hour) || !TryReadDigits(source, ref digitOffset, 2, out int minute) || !TryReadDigits(source, ref digitOffset, 2, out int second))
+                return false;
+
+            if (yearDigitCount == 2)
+                year += year < 50 ? 2000 : 1900;
+
+            if (year < 1 || month is < 1 or > 12 || day < 1 || day > DateTime.DaysInMonth(year, month) || hour > 23 || minute > 59 || second > 59)
+                return false;
+
+            time = new(year, month, day, hour, minute, second, DateTimeKind.Utc);
+
+            return true;
+        }
+
+        /// <summary>
+        /// Reads a run of ASCII decimal digits as a number.
+        /// </summary>
+        /// <param name="source">The bytes.</param>
+        /// <param name="offset">Where the digits start, moved past them.</param>
+        /// <param name="digitCount">How many digits there are, all of them inside <paramref name="source"/>.</param>
+        /// <param name="value">The number.</param>
+        /// <returns>True when every byte was a digit.</returns>
+        private static bool TryReadDigits(byte[] source, ref int offset, int digitCount, out int value)
+        {
+            value = 0;
+
+            for (int i = 0; i < digitCount; i++)
+            {
+                int digit = source[offset++] - '0';
+
+                if (digit is < 0 or > 9)
+                    return false;
+
+                value = value * 10 + digit;
+            }
+
+            return true;
         }
 
         /// <summary>

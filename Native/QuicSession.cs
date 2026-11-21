@@ -885,10 +885,15 @@ namespace Nucleus.Integrations.Unity.Transports
         }
 
         /// <summary>
-        /// Returns whether the certificate a server presented hashes to the pinned value, or whether no value is pinned.
+        /// Returns whether the certificate a server presented hashes to the pinned value and is within the period it is valid for, or
+        /// whether no value is pinned.
         /// </summary>
         /// <param name="certificate">The certificate's DER bytes.</param>
         /// <returns>True when the certificate is accepted.</returns>
+        /// <remarks>
+        /// A pinned certificate is not validated by MsQuic, so its validity is read here, as a browser reads the validity of a certificate it
+        /// is given the hash of.
+        /// </remarks>
         private bool IsPinnedCertificate(MsQuic.QuicBuffer* certificate)
         {
             if (_pinnedCertificateHash is null)
@@ -911,9 +916,27 @@ namespace Nucleus.Integrations.Unity.Transports
                 isPinned = certificateHash[i] == _pinnedCertificateHash[i];
 
             if (!isPinned)
+            {
                 Logger<QuicSession>.LogError($"The server at [{_authority}] presented a certificate whose SHA-256 does not match the pinned certificate hash.");
 
-            return isPinned;
+                return false;
+            }
+
+            if (!SelfSignedCertificate.TryReadValidity(certificateBytes, out DateTime notBefore, out DateTime notAfter))
+            {
+                Logger<QuicSession>.LogError($"The server at [{_authority}] presented a pinned certificate whose validity could not be read.");
+
+                return false;
+            }
+
+            DateTime utcNow = DateTime.UtcNow;
+
+            if (utcNow >= notBefore && utcNow <= notAfter)
+                return true;
+
+            Logger<QuicSession>.LogError($"The server at [{_authority}] presented its pinned certificate outside the period it is valid for, [{notBefore:u}] to [{notAfter:u}]. A server that makes its own certificate must be restarted before it expires.");
+
+            return false;
         }
 
         /// <summary>
