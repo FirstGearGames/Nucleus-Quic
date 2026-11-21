@@ -1,8 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
     <!--
-        Live tests for the WebTransport transport: real CoreManagers over real QUIC on loopback, through MsQuic. On Windows the runtime's
-        own msquic.dll is found beside the shared framework; on Linux libmsquic must be installed. Run in Release.
+        Live tests for the WebTransport transport: real CoreManagers over real QUIC on loopback, through MsQuic. On Windows the transport
+        loads the msquic.dll this package ships, copied beside the tests (see ShippedMsQuic.cs); on Linux libmsquic must be installed. Run in Release.
     -->
     <PropertyGroup>
         <TargetFramework>net9.0</TargetFramework>
@@ -24,6 +24,10 @@
         <Reference Include="Nucleus" HintPath="$(NucleusAssembliesDirectory)\Nucleus.dll" />
         <Reference Include="CodeBoost" HintPath="$(NucleusAssembliesDirectory)\CodeBoost.dll" />
         <Analyzer Include="$(NucleusAssembliesDirectory)\Nucleus.CodeAnalysis.SourceGenerators.dll" />
+    </ItemGroup>
+
+    <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+        <None Include="..\..\Plugins\Windows\x86_64\msquic.dll" Link="msquic.dll" CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 
 </Project>
