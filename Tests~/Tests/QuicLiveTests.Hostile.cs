@@ -1,7 +1,11 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Net;
+using System.Net.Quic;
+using System.Net.Security;
 using System.Reflection;
+using System.Runtime.Versioning;
 using System.Threading.Tasks;
 using Nucleus.Connections;
 using Nucleus.Managers.Core;
@@ -11,12 +15,36 @@ using Xunit;
 
 namespace Nucleus.Integrations.Unity.Transports.Tests;
 
+// The hostile peers are System.Net.Quic, which runs where MsQuic does.
+[SupportedOSPlatform("windows")]
+[SupportedOSPlatform("linux")]
+[SupportedOSPlatform("macos")]
 public partial class QuicLiveTests
 {
     /// <summary>
     /// How long a test waits on something MsQuic does on its own threads before it fails.
     /// </summary>
     private static readonly TimeSpan BackgroundWaitTimeout = TimeSpan.FromSeconds(10);
+    /// <summary>
+    /// The largest reliable packet a server under attack allows, small so a flood passes it quickly.
+    /// </summary>
+    private const int HostileMaximumReliablePacketSize = 64 * 1024;
+    /// <summary>
+    /// The most a hostile peer sends before a test decides nothing will stop it.
+    /// </summary>
+    private const int HostileByteBudget = 16 * 1024 * 1024;
+    /// <summary>
+    /// The size of each write a hostile peer floods with.
+    /// </summary>
+    private const int HostileWriteSize = 16 * 1024;
+    /// <summary>
+    /// The HTTP/3 error code for a clean close.
+    /// </summary>
+    private const long NoErrorCode = 0x100;
+    /// <summary>
+    /// The HTTP/3 error code for a request abandoned by the side that made it.
+    /// </summary>
+    private const long RequestCancelledErrorCode = 0x10C;
 
     /// <summary>
     /// A client whose last packet, departure and successor's arrival all reach the server in one pass has that packet read as its own or
@@ -55,6 +83,75 @@ public partial class QuicLiveTests
         await joiningClientTransport.ShutdownAsync();
         await departingClientTransport.ShutdownAsync();
         await serverTransport.ShutdownAsync();
+    }
+
+    /// <summary>
+    /// A client that opens a reliable stream naming a session no CONNECT has opened, and floods it, is cut off once it has sent more than
+    /// the largest reliable packet, rather than having everything held for a session that never opens.
+    /// </summary>
+    [Fact(Timeout = 60000)]
+    public async Task LiveWebTransport_AReliableStreamOpenedBeforeAnyConnect_IsCutOffPastTheLargestPacket()
+    {
+        ushort port = ProbeFreeUdpPort();
+        (_, Quic serverTransport) = await CreateServerAsync(port);
+        serverTransport.MaximumReliablePacketSize = HostileMaximumReliablePacketSize;
+
+        Assert.Equal(ConnectionStateChangeResult.Success, await serverTransport.ConnectAsync(Invoker.Server));
+
+        await using QuicConnection hostileConnection = await ConnectRawClientAsync(port);
+        await using QuicStream reliableStream = await hostileConnection.OpenOutboundStreamAsync(QuicStreamType.Bidirectional);
+
+        // The two-way stream signal, then session zero, which no CONNECT has opened.
+        await reliableStream.WriteAsync(new byte[] { 0x40, 0x41, 0x00 });
+
+        Assert.True(await IsFloodCutOffAsync(reliableStream), $"The server held [{HostileByteBudget}] bytes on a reliable stream whose session never opened, past the [{HostileMaximumReliablePacketSize}] byte limit, without closing the connection.");
+
+        await serverTransport.ShutdownAsync();
+    }
+
+    /// <summary>
+    /// Opens a bare QUIC connection to a local server, offering HTTP/3 and doing nothing more, for a test to play a hostile client.
+    /// </summary>
+    /// <param name="port">The server's port.</param>
+    /// <returns>The connection, its handshake complete.</returns>
+    private static ValueTask<QuicConnection> ConnectRawClientAsync(ushort port) => QuicConnection.ConnectAsync(new()
+    {
+        RemoteEndPoint = new IPEndPoint(IPAddress.Loopback, port),
+        DefaultStreamErrorCode = RequestCancelledErrorCode,
+        DefaultCloseErrorCode = NoErrorCode,
+        MaxInboundUnidirectionalStreams = 8,
+        ClientAuthenticationOptions = new()
+        {
+            ApplicationProtocols = [SslApplicationProtocol.Http3],
+            TargetHost = "localhost",
+            RemoteCertificateValidationCallback = static (_, _, _, _) => true,
+        },
+    });
+
+    /// <summary>
+    /// Writes filler on a stream until the peer cuts it off or the budget runs out, then writes once more after a pause, so a close already
+    /// on its way is heard.
+    /// </summary>
+    /// <param name="stream">The stream flooded.</param>
+    /// <returns>True when the peer closed the stream or the connection before the flood ended.</returns>
+    private static async Task<bool> IsFloodCutOffAsync(QuicStream stream)
+    {
+        byte[] filler = new byte[HostileWriteSize];
+
+        try
+        {
+            for (int writtenByteCount = 0; writtenByteCount < HostileByteBudget; writtenByteCount += filler.Length)
+                await stream.WriteAsync(filler);
+
+            await Task.Delay(500);
+            await stream.WriteAsync(filler);
+        }
+        catch (QuicException)
+        {
+            return true;
+        }
+
+        return false;
     }
 
     /// <summary>

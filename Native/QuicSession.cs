@@ -456,7 +456,16 @@ namespace Nucleus.Integrations.Unity.Transports
                     break;
                 case QuicStreamKind.Reliable:
                     if (_isOpen)
+                    {
                         ExtractReliablePackets(quicStream);
+                    }
+                    else if (quicStream.Count - Http3.MaximumVariableLengthIntegerSize > _maximumReliablePacketSize)
+                    {
+                        // Nothing is read off a reliable stream until its session opens, so a peer that never opens one is held to one packet.
+                        quicStream.Kind = QuicStreamKind.Ignored;
+                        quicStream.Count = 0;
+                        ShutDown($"more than one packet of the [{_maximumReliablePacketSize}] bytes allowed arrived on the reliable stream before its session opened");
+                    }
 
                     break;
             }
