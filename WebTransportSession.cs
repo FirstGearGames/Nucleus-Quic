@@ -34,6 +34,11 @@ namespace Nucleus.Integrations.Unity.Transports
         /// </summary>
         /// <remarks>Written before the close is queued and read after it is drained, so the queue orders the two.</remarks>
         internal string CloseReason = string.Empty;
+        /// <summary>
+        /// How many of this session's packets the <see cref="WebTransportEvents"/> hold that the network loop has not yet taken.
+        /// </summary>
+        /// <remarks>Changed only under the lock of the events that hold them.</remarks>
+        internal int QueuedPacketCount;
 
         /// <summary>
         /// Sends a packet.

@@ -133,6 +133,20 @@ namespace Nucleus.Integrations.Unity.Transports
         /// The most bytes a request or its response may send before its headers are complete.
         /// </summary>
         private const int MaximumHeaderBytes = 16 * 1024;
+        /// <summary>
+        /// The most packets this session may have queued unread before a datagram is dropped, as a full socket drops one.
+        /// </summary>
+        /// <remarks>A network loop that keeps up never comes near it; a long stall loses the newest datagrams rather than holding everything.</remarks>
+        private const int MaximumQueuedDatagramCount = 1024;
+        /// <summary>
+        /// The most packets this session may have queued unread before a reliable packet closes it.
+        /// </summary>
+        /// <remarks>
+        /// A reliable packet cannot be dropped without breaking the stream, so the session closes instead. Far above
+        /// <see cref="MaximumQueuedDatagramCount"/>, which datagrams therefore never fill it to: only a peer flooding reliable packets, or a
+        /// network loop stalled for minutes, reaches it.
+        /// </remarks>
+        private const int MaximumQueuedReliablePacketCount = 16384;
 
         /// <summary>
         /// Creates a session and the handle MsQuic will hold as its context.
@@ -704,7 +718,16 @@ namespace Nucleus.Integrations.Unity.Transports
                 {
                     byte[] payloadArray = TrackedArrayPool<byte>.Rent((int)packetLength);
                     Buffer.BlockCopy(quicStream.Buffer, frameOffset, payloadArray, 0, (int)packetLength);
-                    _events.EnqueueReceived(this, new(payloadArray, 0, (int)packetLength), Channel.Reliable);
+
+                    if (!_events.TryEnqueueReceived(this, new(payloadArray, 0, (int)packetLength), Channel.Reliable, MaximumQueuedReliablePacketCount))
+                    {
+                        TrackedArrayPool<byte>.Return(payloadArray);
+                        quicStream.Kind = QuicStreamKind.Ignored;
+                        quicStream.Count = 0;
+                        ShutDown($"more than [{MaximumQueuedReliablePacketCount}] packets arrived before they were read");
+
+                        return;
+                    }
                 }
 
                 offset = frameOffset + (int)packetLength;
@@ -734,7 +757,9 @@ namespace Nucleus.Integrations.Unity.Transports
 
             byte[] payloadArray = TrackedArrayPool<byte>.Rent(payloadLength);
             Marshal.Copy((IntPtr)(datagram->Buffer + prefixSize), payloadArray, 0, payloadLength);
-            _events.EnqueueReceived(this, new(payloadArray, 0, payloadLength), Channel.Unreliable);
+
+            if (!_events.TryEnqueueReceived(this, new(payloadArray, 0, payloadLength), Channel.Unreliable, MaximumQueuedDatagramCount))
+                TrackedArrayPool<byte>.Return(payloadArray);
         }
 
         /// <summary>

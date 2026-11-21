@@ -42,6 +42,18 @@ public partial class QuicLiveTests
     /// </summary>
     private const int HostileWriteSize = 16 * 1024;
     /// <summary>
+    /// How many packets a flooding peer sends between two of the server's passes, well past either cap below.
+    /// </summary>
+    private const int FloodPacketCount = 40_000;
+    /// <summary>
+    /// The most packets a session may have queued unread before its datagrams are dropped, as the transport sets it.
+    /// </summary>
+    private const int MaximumQueuedDatagramCount = 1024;
+    /// <summary>
+    /// The most packets a session may have queued unread before a reliable one closes it, as the transport sets it.
+    /// </summary>
+    private const int MaximumQueuedReliablePacketCount = 16384;
+    /// <summary>
     /// The HTTP/3 error code for a clean close.
     /// </summary>
     private const long NoErrorCode = 0x100;
@@ -266,6 +278,91 @@ public partial class QuicLiveTests
     }
 
     /// <summary>
+    /// A client that floods tiny reliable packets between two of the server's passes has exactly as many of them queued as a session may hold,
+    /// and is cut off, rather than having MsQuic's threads queue every one of them for the network loop.
+    /// </summary>
+    [Fact(Timeout = 60000)]
+    public async Task LiveWebTransport_AFloodOfReliablePacketsBetweenTwoPasses_IsHeldToTheQueueCap()
+    {
+        ushort port = ProbeFreeUdpPort();
+        (_, Quic serverTransport) = await StartServerAsync(port);
+
+        await using QuicConnection hostileConnection = await ConnectRawClientAsync(port);
+        await using QuicStream connectStream = await hostileConnection.OpenOutboundStreamAsync(QuicStreamType.Bidirectional);
+
+        await connectStream.WriteAsync(CreateConnectRequestFrame(CreatePlainProtocolFieldLine("webtransport")));
+        Assert.True(await IsConnectAcceptedAsync(connectStream));
+
+        // The stream signal and session zero, the CONNECT's stream, then one-byte packets each behind a one-byte length.
+        byte[] flood = new byte[3 + FloodPacketCount * 2];
+        flood[0] = 0x40;
+        flood[1] = 0x41;
+
+        for (int i = 0; i < FloodPacketCount; i++)
+            flood[3 + i * 2] = 0x01;
+
+        await using QuicStream reliableStream = await hostileConnection.OpenOutboundStreamAsync(QuicStreamType.Bidirectional);
+        await reliableStream.WriteAsync(flood);
+
+        int queuedPacketCount = await WaitForQueuedServerPacketsToSettleAsync(serverTransport, Channel.Reliable);
+
+        await hostileConnection.CloseAsync(NoErrorCode);
+        await serverTransport.ShutdownAsync();
+
+        Assert.True(queuedPacketCount == MaximumQueuedReliablePacketCount, $"The server queued [{queuedPacketCount}] of the [{FloodPacketCount}] reliable packets one session sent between two passes, where a session may hold [{MaximumQueuedReliablePacketCount}].");
+    }
+
+    /// <summary>
+    /// A client that floods datagrams between two of the server's passes has exactly as many of them queued as a session may hold, the rest
+    /// dropped as a full socket drops them, rather than having MsQuic's threads queue every one of them for the network loop.
+    /// </summary>
+    [Fact(Timeout = 60000)]
+    public async Task LiveWebTransport_AFloodOfDatagramsBetweenTwoPasses_IsHeldToTheQueueCap()
+    {
+        ushort port = ProbeFreeUdpPort();
+        (CoreManager server, Quic serverTransport) = await StartServerAsync(port);
+        (CoreManager client, Quic clientTransport) = await ConnectClientAsync(port, serverTransport.ServerCertificateHash);
+
+        await DriveUntilAsync(server, client, () => IsClientAuthenticated(client));
+
+        // What the client sent while authenticating is read first, so the flood counts against an empty queue; the client is not driven again.
+        for (int i = 0; i < 5; i++)
+        {
+            await Task.Delay(20);
+            DriveFullTick(server);
+        }
+
+        // The client's own session sends the datagrams directly, so the engine's batching cannot fold them together.
+        object clientSession = typeof(QuicClientSocket).GetField("_webTransportSession", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(clientTransport.ClientSocket)!;
+        MethodInfo trySend = clientSession.GetType().GetMethod("TrySend", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        object[] trySendArguments = [Channel.Unreliable, new ArraySegment<byte>([0xAA])];
+        int sentDatagramCount = 0;
+
+        for (int i = 0; i < FloodPacketCount; i++)
+        {
+            if ((bool)trySend.Invoke(clientSession, trySendArguments)!)
+                sentDatagramCount++;
+        }
+
+        int queuedPacketCount = await WaitForQueuedServerPacketsToSettleAsync(serverTransport, Channel.Unreliable);
+
+        // Once the network loop has taken them, which the queue's own drain stands in for, the session may queue as many again.
+        object serverEvents = GetServerEvents(serverTransport);
+        serverEvents.GetType().GetMethod("Clear", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(serverEvents, null);
+
+        for (int i = 0; i < FloodPacketCount; i++)
+            trySend.Invoke(clientSession, trySendArguments);
+
+        int requeuedPacketCount = await WaitForQueuedServerPacketsToSettleAsync(serverTransport, Channel.Unreliable);
+
+        await clientTransport.ShutdownAsync();
+        await serverTransport.ShutdownAsync();
+
+        Assert.True(queuedPacketCount == MaximumQueuedDatagramCount, $"The server queued [{queuedPacketCount}] of the [{sentDatagramCount}] datagrams one session sent between two passes, where a session may hold [{MaximumQueuedDatagramCount}].");
+        Assert.True(requeuedPacketCount == MaximumQueuedDatagramCount, $"Once its first [{queuedPacketCount}] datagrams were taken, the server queued [{requeuedPacketCount}] of the session's next flood, where a session may hold [{MaximumQueuedDatagramCount}].");
+    }
+
+    /// <summary>
     /// Opens a bare QUIC connection to a local server, offering HTTP/3 and doing nothing more, for a test to play a hostile client.
     /// </summary>
     /// <param name="port">The server's port.</param>
@@ -459,6 +556,39 @@ public partial class QuicLiveTests
     }
 
     /// <summary>
+    /// Waits, without driving the server, until the packets its MsQuic threads have queued on a channel stop growing.
+    /// </summary>
+    /// <param name="serverTransport">The server's transport.</param>
+    /// <param name="channel">The channel counted.</param>
+    /// <returns>How many packets were queued on the channel once the count settled.</returns>
+    private static async Task<int> WaitForQueuedServerPacketsToSettleAsync(Quic serverTransport, Channel channel)
+    {
+        DateTime deadline = DateTime.UtcNow + BackgroundWaitTimeout;
+        int queuedPacketCount = 0;
+
+        while (DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(250);
+
+            int nextQueuedPacketCount = ReadQueuedServerEvents(serverTransport).FindAll(queuedEvent => queuedEvent.Type == "Received" && queuedEvent.Channel == channel).Count;
+
+            if (nextQueuedPacketCount > 0 && nextQueuedPacketCount == queuedPacketCount)
+                return queuedPacketCount;
+
+            queuedPacketCount = nextQueuedPacketCount;
+        }
+
+        return queuedPacketCount;
+    }
+
+    /// <summary>
+    /// Returns the queue a server's MsQuic threads report into.
+    /// </summary>
+    /// <param name="serverTransport">The server's transport.</param>
+    /// <returns>The server socket's <c>WebTransportEvents</c>.</returns>
+    private static object GetServerEvents(Quic serverTransport) => typeof(QuicServerSocket).GetField("_events", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(serverTransport.ServerSocket)!;
+
+    /// <summary>
     /// Reads what a server's MsQuic threads have queued for its next receive pass, without taking any of it.
     /// </summary>
     /// <param name="serverTransport">The server's transport.</param>
@@ -468,7 +598,7 @@ public partial class QuicLiveTests
     {
         const BindingFlags InstanceFieldFlags = BindingFlags.Instance | BindingFlags.NonPublic;
 
-        object events = typeof(QuicServerSocket).GetField("_events", InstanceFieldFlags)!.GetValue(serverTransport.ServerSocket)!;
+        object events = GetServerEvents(serverTransport);
         object eventsLock = events.GetType().GetField("_lock", InstanceFieldFlags)!.GetValue(events)!;
         IEnumerable queuedEvents = (IEnumerable)events.GetType().GetField("_queuedEvents", InstanceFieldFlags)!.GetValue(events)!;
         List<(string Type, Channel Channel)> readEvents = new();

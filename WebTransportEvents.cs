@@ -11,7 +11,8 @@ namespace Nucleus.Integrations.Unity.Transports
     /// </summary>
     /// <remarks>
     /// MsQuic reports everything on its own worker threads, so the queue is locked. It is a plain Queue behind a lock rather than a
-    /// ConcurrentQueue, which allocates a new segment every few dozen enqueues.
+    /// ConcurrentQueue, which allocates a new segment every few dozen enqueues. Each session's queued packets are counted under the same
+    /// lock, so a session can be held to what it may queue before the network loop reads it.
     /// </remarks>
     internal sealed class WebTransportEvents
     {
@@ -31,12 +32,35 @@ namespace Nucleus.Integrations.Unity.Transports
         internal void EnqueueOpened(WebTransportSession session) => Enqueue(new(WebTransportEventType.Opened, session, default, Channel.Unreliable));
 
         /// <summary>
-        /// Queues a packet having arrived.
+        /// Queues a packet having arrived, however many its session already has queued.
         /// </summary>
         /// <param name="session">The session it arrived on.</param>
         /// <param name="payload">The packet, over an array rented from <see cref="TrackedArrayPool{T0}"/> which the queue now owns.</param>
         /// <param name="channel">The channel it arrived on.</param>
-        internal void EnqueueReceived(WebTransportSession session, ArraySegment<byte> payload, Channel channel) => Enqueue(new(WebTransportEventType.Received, session, payload, channel));
+        /// <remarks>For a session read on the network loop thread itself, whose queue is drained in the same pass it is filled.</remarks>
+        internal void EnqueueReceived(WebTransportSession session, ArraySegment<byte> payload, Channel channel) => TryEnqueueReceived(session, payload, channel, int.MaxValue);
+
+        /// <summary>
+        /// Queues a packet having arrived, unless its session already has as many queued as it may hold.
+        /// </summary>
+        /// <param name="session">The session it arrived on.</param>
+        /// <param name="payload">The packet, over an array rented from <see cref="TrackedArrayPool{T0}"/> which the queue owns once it is queued.</param>
+        /// <param name="channel">The channel it arrived on.</param>
+        /// <param name="maximumQueuedPacketCount">The most packets the session may have queued before this one.</param>
+        /// <returns>True when the packet was queued; false when the session already holds as many as it may, and the caller keeps the array.</returns>
+        internal bool TryEnqueueReceived(WebTransportSession session, ArraySegment<byte> payload, Channel channel, int maximumQueuedPacketCount)
+        {
+            lock (_lock)
+            {
+                if (session.QueuedPacketCount >= maximumQueuedPacketCount)
+                    return false;
+
+                session.QueuedPacketCount++;
+                _queuedEvents.Enqueue(new(WebTransportEventType.Received, session, payload, channel));
+            }
+
+            return true;
+        }
 
         /// <summary>
         /// Queues a session having closed.
@@ -52,7 +76,15 @@ namespace Nucleus.Integrations.Unity.Transports
         internal bool TryDequeue(out WebTransportEvent webTransportEvent)
         {
             lock (_lock)
-                return _queuedEvents.TryDequeue(out webTransportEvent);
+            {
+                if (!_queuedEvents.TryDequeue(out webTransportEvent))
+                    return false;
+
+                if (webTransportEvent.Type is WebTransportEventType.Received)
+                    webTransportEvent.Session.QueuedPacketCount--;
+
+                return true;
+            }
         }
 
         /// <summary>
