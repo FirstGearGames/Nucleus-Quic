@@ -110,6 +110,11 @@ namespace Nucleus.Integrations.Unity.Transports
         /// </summary>
         private int _maximumDatagramSize;
         /// <summary>
+        /// How many streams the peer has opened on this connection.
+        /// </summary>
+        /// <remarks>Touched only on the MsQuic worker thread.</remarks>
+        private uint _peerStreamCount;
+        /// <summary>
         /// The handler MsQuic calls for connection events, held so it is never collected.
         /// </summary>
         private static readonly MsQuic.ConnectionCallback ConnectionHandler = OnConnectionEvent;
@@ -147,6 +152,15 @@ namespace Nucleus.Integrations.Unity.Transports
         /// network loop stalled for minutes, reaches it.
         /// </remarks>
         private const int MaximumQueuedReliablePacketCount = 16384;
+        /// <summary>
+        /// The most streams the peer may open over the connection's life, well past the ones a session opens: its control and QPACK streams,
+        /// its CONNECT and its reliable stream.
+        /// </summary>
+        /// <remarks>
+        /// MsQuic gives the peer room for another stream each time one closes, so the limit on streams open at once never stops a peer that
+        /// resets every stream it opens; this one does, by closing the connection.
+        /// </remarks>
+        private const uint MaximumPeerStreamCount = 32;
 
         /// <summary>
         /// Creates a session and the handle MsQuic will hold as its context.
@@ -389,6 +403,9 @@ namespace Nucleus.Integrations.Unity.Transports
                     // A server reads which kind of stream a two-way stream is from its first bytes; anything else the peer opens is read and dropped.
                     _streamsByHandle[connectionEvent->PeerStream] = new() { Kind = _isServer && !isUnidirectional ? QuicStreamKind.Unclassified : QuicStreamKind.Ignored };
                     _msQuic.SetCallbackHandler(connectionEvent->PeerStream, StreamHandlerPointer, GCHandle.ToIntPtr(_contextHandle));
+
+                    if (++_peerStreamCount > MaximumPeerStreamCount)
+                        ShutDown($"the peer opened more than the [{MaximumPeerStreamCount}] streams a session may");
 
                     break;
                 }

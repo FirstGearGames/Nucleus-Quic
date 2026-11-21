@@ -48,6 +48,10 @@ public partial class QuicLiveTests
     /// </summary>
     private const int FloodPacketCount = 40_000;
     /// <summary>
+    /// The most streams a hostile peer opens and resets before a test decides nothing will stop it.
+    /// </summary>
+    private const int HostileStreamBudget = 1000;
+    /// <summary>
     /// The most packets a session may have queued unread before its datagrams are dropped, as the transport sets it.
     /// </summary>
     private const int MaximumQueuedDatagramCount = 1024;
@@ -454,6 +458,43 @@ public partial class QuicLiveTests
 
         Assert.True(queuedPacketCount == MaximumQueuedDatagramCount, $"The server queued [{queuedPacketCount}] of the [{sentDatagramCount}] datagrams one session sent between two passes, where a session may hold [{MaximumQueuedDatagramCount}].");
         Assert.True(requeuedPacketCount == MaximumQueuedDatagramCount, $"Once its first [{queuedPacketCount}] datagrams were taken, the server queued [{requeuedPacketCount}] of the session's next flood, where a session may hold [{MaximumQueuedDatagramCount}].");
+    }
+
+    /// <summary>
+    /// A client that opens stream after stream and resets each at once, every reset making room for the next, is closed once it has opened
+    /// more streams than a session uses, rather than being served for as long as it keeps going.
+    /// </summary>
+    /// <param name="quicStreamType">The kind of stream opened and reset.</param>
+    [Theory(Timeout = 60000)]
+    [InlineData(QuicStreamType.Unidirectional)]
+    [InlineData(QuicStreamType.Bidirectional)]
+    public async Task LiveWebTransport_AClientResettingEveryStreamItOpens_IsClosed(QuicStreamType quicStreamType)
+    {
+        ushort port = ProbeFreeUdpPort();
+        (_, Quic serverTransport) = await StartServerAsync(port);
+
+        await using QuicConnection hostileConnection = await ConnectRawClientAsync(port);
+        byte[] firstByte = { 0x21 };
+        int resetStreamCount = 0;
+
+        try
+        {
+            // One byte, so the server takes the stream up, then a reset of both directions.
+            for (; resetStreamCount < HostileStreamBudget; resetStreamCount++)
+            {
+                await using QuicStream stream = await hostileConnection.OpenOutboundStreamAsync(quicStreamType);
+                await stream.WriteAsync(firstByte);
+                stream.Abort(QuicAbortDirection.Both, RequestCancelledErrorCode);
+            }
+        }
+        catch (QuicException)
+        {
+            // Closed by the server.
+        }
+
+        await serverTransport.ShutdownAsync();
+
+        Assert.True(resetStreamCount < HostileStreamBudget, $"The server served [{HostileStreamBudget}] {quicStreamType} streams one connection opened and reset at once, without closing it.");
     }
 
     /// <summary>
