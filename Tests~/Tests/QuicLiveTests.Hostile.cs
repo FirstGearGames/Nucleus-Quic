@@ -6,6 +6,8 @@ using System.Net.Quic;
 using System.Net.Security;
 using System.Reflection;
 using System.Runtime.Versioning;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Threading.Tasks;
 using Nucleus.Connections;
 using Nucleus.Managers.Core;
@@ -110,6 +112,30 @@ public partial class QuicLiveTests
     }
 
     /// <summary>
+    /// A server that answers the client's CONNECT with headers that never end is dropped once it has sent more header bytes than a request
+    /// may, and the client falls back to Disconnected, rather than holding everything while it waits in Connecting.
+    /// </summary>
+    [Fact(Timeout = 60000)]
+    public async Task LiveWebTransport_AServerWhoseResponseHeadersNeverEnd_IsDroppedByTheClient()
+    {
+        using X509Certificate2 certificate = CreateRawServerCertificate(DateTimeOffset.UtcNow.AddHours(-1), DateTimeOffset.UtcNow.AddDays(13));
+        await using QuicListener hostileListener = await ListenRawServerAsync(certificate);
+        (CoreManager client, Quic clientTransport) = await ConnectClientAsync((ushort)hostileListener.LocalEndPoint.Port, Convert.ToHexString(SHA256.HashData(certificate.RawData)));
+
+        await using QuicConnection hostileConnection = await hostileListener.AcceptConnectionAsync();
+        await using QuicStream connectStream = await AcceptBidirectionalStreamAsync(hostileConnection);
+
+        // A HEADERS frame announced as a gigabyte long, which never ends.
+        await connectStream.WriteAsync(new byte[] { 0x01, 0xC0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00 });
+
+        bool isFloodCutOff = await IsFloodCutOffAsync(connectStream);
+
+        await DriveUntilAsync(client, client, () => clientTransport.ClientSocket.State is LocalConnectionState.Disconnected, () => $"The client is still [{clientTransport.ClientSocket.State}] after the server sent [{HostileByteBudget}] bytes of headers that never ended, and the flood was cut off: [{isFloodCutOff}].");
+
+        await clientTransport.ShutdownAsync();
+    }
+
+    /// <summary>
     /// Opens a bare QUIC connection to a local server, offering HTTP/3 and doing nothing more, for a test to play a hostile client.
     /// </summary>
     /// <param name="port">The server's port.</param>
@@ -127,6 +153,61 @@ public partial class QuicLiveTests
             RemoteCertificateValidationCallback = static (_, _, _, _) => true,
         },
     });
+
+    /// <summary>
+    /// Starts a bare QUIC listener on a free loopback port, offering HTTP/3 and doing nothing more, for a test to play a hostile server.
+    /// </summary>
+    /// <param name="certificate">The certificate it presents, which the Nucleus client pins.</param>
+    /// <returns>The listener.</returns>
+    private static ValueTask<QuicListener> ListenRawServerAsync(X509Certificate2 certificate) => QuicListener.ListenAsync(new()
+    {
+        ListenEndPoint = new IPEndPoint(IPAddress.Loopback, 0),
+        ApplicationProtocols = [SslApplicationProtocol.Http3],
+        ConnectionOptionsCallback = (_, _, _) => ValueTask.FromResult(new QuicServerConnectionOptions
+        {
+            DefaultStreamErrorCode = RequestCancelledErrorCode,
+            DefaultCloseErrorCode = NoErrorCode,
+            MaxInboundBidirectionalStreams = 4,
+            MaxInboundUnidirectionalStreams = 8,
+            ServerAuthenticationOptions = new()
+            {
+                ApplicationProtocols = [SslApplicationProtocol.Http3],
+                ServerCertificate = certificate,
+            },
+        }),
+    });
+
+    /// <summary>
+    /// Makes a self-signed ECDSA P-256 certificate, the kind a browser accepts by its hash, valid between two times.
+    /// </summary>
+    /// <param name="notBefore">When it becomes valid.</param>
+    /// <param name="notAfter">When it expires.</param>
+    /// <returns>The certificate, with its private key in a stored key the certificate deletes when it is disposed.</returns>
+    /// <remarks>Schannel signs in another process, which cannot reach an ephemeral key, so the key is carried through PKCS #12 into a stored one.</remarks>
+    private static X509Certificate2 CreateRawServerCertificate(DateTimeOffset notBefore, DateTimeOffset notAfter)
+    {
+        using ECDsa ecdsa = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        CertificateRequest certificateRequest = new("CN=localhost", ecdsa, HashAlgorithmName.SHA256);
+        using X509Certificate2 ephemeralCertificate = certificateRequest.CreateSelfSigned(notBefore, notAfter);
+
+        return X509CertificateLoader.LoadPkcs12(ephemeralCertificate.Export(X509ContentType.Pfx), password: null);
+    }
+
+    /// <summary>
+    /// Takes the first two-way stream a peer opens, passing over the one-way streams it opens first.
+    /// </summary>
+    /// <param name="quicConnection">The connection.</param>
+    /// <returns>The stream.</returns>
+    private static async Task<QuicStream> AcceptBidirectionalStreamAsync(QuicConnection quicConnection)
+    {
+        while (true)
+        {
+            QuicStream quicStream = await quicConnection.AcceptInboundStreamAsync();
+
+            if (quicStream.Type is QuicStreamType.Bidirectional)
+                return quicStream;
+        }
+    }
 
     /// <summary>
     /// Writes filler on a stream until the peer cuts it off or the budget runs out, then writes once more after a pause, so a close already

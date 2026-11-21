@@ -126,7 +126,7 @@ namespace Nucleus.Integrations.Unity.Transports
         /// </summary>
         private const long UnsetStreamId = -1;
         /// <summary>
-        /// The most bytes a request may send before its headers are complete.
+        /// The most bytes a request or its response may send before its headers are complete.
         /// </summary>
         private const int MaximumHeaderBytes = 16 * 1024;
 
@@ -562,7 +562,16 @@ namespace Nucleus.Integrations.Unity.Transports
             int offset = 0;
 
             if (!Http3.TryReadHeadersFrame(quicStream.Buffer, ref offset, quicStream.Count, out int fieldSectionOffset, out int fieldSectionEnd))
+            {
+                if (quicStream.Count > MaximumHeaderBytes)
+                {
+                    quicStream.Kind = QuicStreamKind.Ignored;
+                    quicStream.Count = 0;
+                    ShutDown($"the server sent more than [{MaximumHeaderBytes}] bytes without finishing its response headers");
+                }
+
                 return;
+            }
 
             bool isOkResponse = Http3.IsOkResponse(quicStream.Buffer, fieldSectionOffset, fieldSectionEnd);
 
