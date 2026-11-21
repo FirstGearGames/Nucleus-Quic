@@ -13,7 +13,7 @@ Where each build gets its QUIC library:
 |---|---|
 | Windows, Editor and builds | `Plugins/Windows/x86_64/msquic.dll`, which ships in this package. |
 | WebGL | The browser's own WebTransport, through `Plugins/WebGL/WebTransport.jslib`. Chrome, Edge and Firefox support it. |
-| Linux | Install MsQuic from packages.microsoft.com (`sudo apt install libmsquic`). If only `libmsquic.so.2` is installed, add a `libmsquic.so` link beside it. Not yet tested. |
+| Linux | Install MsQuic 2.5.13 or newer from packages.microsoft.com (`sudo apt install libmsquic`); older builds lack security fixes. If only `libmsquic.so.2` is installed, add a `libmsquic.so` link beside it. Not yet tested. |
 | macOS | None. MsQuic has no supported macOS build, so a Mac player can only connect from a browser. |
 
 ## Install
@@ -77,4 +77,4 @@ dotnet test "Tests~/Tests" -c Release -p:NucleusAssembliesDirectory="<your proje
 
 ## License
 
-MIT. See [LICENSE](LICENSE). `msquic.dll` is Microsoft's MsQuic 2.4.8, also under the MIT license; see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+MIT. See [LICENSE](LICENSE). `msquic.dll` is Microsoft's MsQuic 2.5.13, also under the MIT license; see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

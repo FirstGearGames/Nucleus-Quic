@@ -2,7 +2,7 @@
 
 ## MsQuic
 
-`Plugins/Windows/x86_64/msquic.dll` is MsQuic 2.4.8 from https://github.com/microsoft/msquic.
+`Plugins/Windows/x86_64/msquic.dll` is MsQuic 2.5.13 from https://github.com/microsoft/msquic.
 
 MIT License
 
