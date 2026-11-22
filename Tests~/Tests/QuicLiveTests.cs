@@ -241,14 +241,16 @@ public partial class QuicLiveTests
     /// </summary>
     /// <param name="port">The server's port.</param>
     /// <param name="certificateHash">The hash the client pins.</param>
+    /// <param name="isPinnedCertificateValidityLimitEnabled">Whether the client refuses a pinned certificate valid for more than 14 days.</param>
     /// <returns>The client and its transport.</returns>
-    private static async Task<(CoreManager, Quic)> ConnectClientAsync(ushort port, string certificateHash)
+    private static async Task<(CoreManager, Quic)> ConnectClientAsync(ushort port, string certificateHash, bool isPinnedCertificateValidityLimitEnabled = false)
     {
         CoreManager client = CreateManager();
         Quic clientTransport = (Quic)await client.TransportManager.AddTransportAsync<Quic>();
         clientTransport.SetPort(port);
         clientTransport.RemoteHost = "127.0.0.1";
         clientTransport.CertificateHash = certificateHash;
+        clientTransport.PinnedCertificateValidityLimitEnabled = isPinnedCertificateValidityLimitEnabled;
 
         Assert.Equal(ConnectionStateChangeResult.Success, await clientTransport.ConnectAsync(Invoker.Client));
 

@@ -113,6 +113,12 @@ namespace Nucleus.Integrations.Unity.Transports
         [Tooltip("Client only. The SHA-256 of the server's certificate as 64 hex characters, which the server logs when it makes its own. Empty trusts only certificates the system or browser trusts.")]
         private string _certificateHash = string.Empty;
         /// <summary>
+        /// Whether a client refuses a pinned certificate valid for more than 14 days in total, as a browser does.
+        /// </summary>
+        [SerializeField]
+        [Tooltip("Client only. Refuse a server whose pinned certificate is valid for more than 14 days in total, as a browser does. Leave off to pin a long-lived certificate file.")]
+        private bool _pinnedCertificateValidityLimitEnabled;
+        /// <summary>
         /// The most clients the server accepts at once.
         /// </summary>
         [SerializeField]
@@ -165,6 +171,7 @@ namespace Nucleus.Integrations.Unity.Transports
             _quic.CertificatePath = _certificatePath;
             _quic.CertificatePassword = _certificatePassword;
             _quic.CertificateHash = _certificateHash;
+            _quic.PinnedCertificateValidityLimitEnabled = _pinnedCertificateValidityLimitEnabled;
             _quic.SetMaximumConnections(_maximumConnections);
             _quic.MaximumReliablePacketSize = _maximumReliablePacketSize;
             _quic.AllowedOrigins = _allowedOrigins;

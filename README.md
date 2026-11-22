@@ -45,6 +45,7 @@ A host's own client, pointed at this machine on the server's port, joins its ser
 | Certificate Path | empty | Server only. A PKCS #12 (`.pfx`) file holding the certificate and its private key. Empty makes a new certificate on every start. |
 | Certificate Password | empty | Server only. The password protecting the certificate file. |
 | Certificate Hash | empty | Client only. The SHA-256 of the server's certificate as 64 hex characters. Empty trusts only certificates the system or browser already trusts. |
+| Pinned Certificate Validity Limit Enabled | off | Client only. Refuses a pinned certificate that is valid for more than 14 days in total, as a browser does. See [Certificates](#certificates). |
 | Maximum Connections | 0 | Server only. The most clients the server accepts at once. 0 accepts any number. Connections past twice this, counting those still opening, are refused at their handshake. |
 | Maximum Transmission Unit | 1200 | The largest packet built before it is split. Keep it at 1200 unless every network path is known to carry more. |
 | Maximum Reliable Packet Size | 1048576 | Server only. The largest reliable packet, in bytes, a client may send. A client that sends a larger one is disconnected. |
@@ -61,6 +62,8 @@ A browser only connects to a server whose certificate it trusts. There are two w
 **A certificate the server makes itself.** Leave **Certificate Path** empty. The server makes a new certificate every time it starts and logs its hash. Give that hash to every client as **Certificate Hash**, through whatever your game uses to find servers. A browser accepts a certificate like this for 14 days at most, so the server makes it valid for 13. A server that runs longer must be restarted or given a real certificate. This is how to develop locally, because no authority signs a certificate for `127.0.0.1`.
 
 **A certificate from a public authority.** Put the certificate and its private key in a `.pfx` file, set **Certificate Path** and **Certificate Password** on the server, and point clients at the domain the certificate names. Clients leave **Certificate Hash** empty.
+
+**Holding native clients to the browser's limit.** A browser refuses a pinned certificate that is valid for more than 14 days in total. Native clients accept a longer one by default, so a game that only ships native builds can pin a long-lived certificate file and keep the same hash. Turn on **Pinned Certificate Validity Limit Enabled** on clients when the game also ships a WebGL build, so a certificate a browser would refuse is refused on every platform. A certificate the server makes itself is valid for 13 days, so it passes either way.
 
 ## Allowed origins
 

@@ -52,6 +52,11 @@ namespace Nucleus.Integrations.Unity.Transports
         /// </summary>
         private readonly byte[] _pinnedCertificateHash;
         /// <summary>
+        /// Whether a pinned certificate valid for longer than <see cref="MaximumPinnedCertificateValidityPeriod"/> in total is refused, as a
+        /// browser refuses it.
+        /// </summary>
+        private readonly bool _pinnedCertificateValidityLimitEnabled;
+        /// <summary>
         /// The host and port a client's CONNECT names.
         /// </summary>
         private readonly string _authority;
@@ -135,6 +140,10 @@ namespace Nucleus.Integrations.Unity.Transports
         /// </summary>
         private static readonly byte[] ForbiddenResponse = Http3.CreateForbiddenResponse();
         /// <summary>
+        /// The longest a browser accepts a certificate it was given the hash of as valid for, from the start of its validity to its expiry.
+        /// </summary>
+        private static readonly TimeSpan MaximumPinnedCertificateValidityPeriod = TimeSpan.FromDays(14);
+        /// <summary>
         /// The value of a stream identifier not yet known.
         /// </summary>
         private const long UnsetStreamId = -1;
@@ -175,8 +184,9 @@ namespace Nucleus.Integrations.Unity.Transports
         /// <param name="isServer">Whether this is a server's session.</param>
         /// <param name="maximumReliablePacketSize">The largest reliable packet the peer may send.</param>
         /// <param name="pinnedCertificateHash">The hash a client requires of the server's certificate, or <see langword="null"/>.</param>
+        /// <param name="isPinnedCertificateValidityLimitEnabled">Whether a client refuses a pinned certificate valid for more than 14 days in total.</param>
         /// <param name="authority">The host and port a client's CONNECT names, or <see langword="null"/> on a server.</param>
-        private QuicSession(MsQuic msQuic, WebTransportEvents events, QuicListener quicListener, bool isServer, int maximumReliablePacketSize, byte[] pinnedCertificateHash, string authority)
+        private QuicSession(MsQuic msQuic, WebTransportEvents events, QuicListener quicListener, bool isServer, int maximumReliablePacketSize, byte[] pinnedCertificateHash, bool isPinnedCertificateValidityLimitEnabled, string authority)
         {
             _msQuic = msQuic;
             _events = events;
@@ -184,6 +194,7 @@ namespace Nucleus.Integrations.Unity.Transports
             _isServer = isServer;
             _maximumReliablePacketSize = maximumReliablePacketSize;
             _pinnedCertificateHash = pinnedCertificateHash;
+            _pinnedCertificateValidityLimitEnabled = isPinnedCertificateValidityLimitEnabled;
             _authority = authority;
             _contextHandle = GCHandle.Alloc(this);
         }
@@ -305,7 +316,7 @@ namespace Nucleus.Integrations.Unity.Transports
             if (!msQuic.IsSucceeded(configurationStatus))
                 return configurationStatus;
 
-            quicSession = new(msQuic, events, quicListener, isServer: true, maximumReliablePacketSize, pinnedCertificateHash: null, authority: null)
+            quicSession = new(msQuic, events, quicListener, isServer: true, maximumReliablePacketSize, pinnedCertificateHash: null, isPinnedCertificateValidityLimitEnabled: false, authority: null)
             {
                 RemoteAddress = remoteAddress,
                 _connection = connection,
@@ -325,11 +336,12 @@ namespace Nucleus.Integrations.Unity.Transports
         /// <param name="host">The server's host name or IP address.</param>
         /// <param name="port">The server's port.</param>
         /// <param name="pinnedCertificateHash">The hash the server's certificate must have, or <see langword="null"/> to validate it against the system's trust store.</param>
+        /// <param name="isPinnedCertificateValidityLimitEnabled">Whether a pinned certificate valid for more than 14 days in total is refused, as a browser refuses it.</param>
         /// <param name="quicSession">The session, which reports opening or closing through <paramref name="events"/>.</param>
         /// <returns>True when the connection was started.</returns>
-        internal static bool TryConnect(MsQuic msQuic, WebTransportEvents events, IntPtr configuration, string host, ushort port, byte[] pinnedCertificateHash, out QuicSession quicSession)
+        internal static bool TryConnect(MsQuic msQuic, WebTransportEvents events, IntPtr configuration, string host, ushort port, byte[] pinnedCertificateHash, bool isPinnedCertificateValidityLimitEnabled, out QuicSession quicSession)
         {
-            quicSession = new(msQuic, events, quicListener: null, isServer: false, int.MaxValue, pinnedCertificateHash, authority: $"{host}:{port}") { RemoteAddress = host };
+            quicSession = new(msQuic, events, quicListener: null, isServer: false, int.MaxValue, pinnedCertificateHash, isPinnedCertificateValidityLimitEnabled, authority: $"{host}:{port}") { RemoteAddress = host };
 
             IntPtr connection;
             int openStatus = msQuic.ConnectionOpen(msQuic.Registration, ConnectionHandlerPointer, GCHandle.ToIntPtr(quicSession._contextHandle), &connection);
@@ -935,14 +947,16 @@ namespace Nucleus.Integrations.Unity.Transports
         }
 
         /// <summary>
-        /// Returns whether the certificate a server presented hashes to the pinned value and is within the period it is valid for, or
-        /// whether no value is pinned.
+        /// Returns whether the certificate a server presented hashes to the pinned value and is within the period it is valid for, and, when
+        /// <see cref="_pinnedCertificateValidityLimitEnabled"/> is set, whether that period is no longer than a browser allows; or whether
+        /// no value is pinned.
         /// </summary>
         /// <param name="certificate">The certificate's DER bytes.</param>
         /// <returns>True when the certificate is accepted.</returns>
         /// <remarks>
         /// A pinned certificate is not validated by MsQuic, so its validity is read here, as a browser reads the validity of a certificate it
-        /// is given the hash of.
+        /// is given the hash of. The length of the period is only held to a browser's limit when asked, since a native game may pin a
+        /// long-lived certificate file.
         /// </remarks>
         private bool IsPinnedCertificate(MsQuic.QuicBuffer* certificate)
         {
@@ -975,6 +989,13 @@ namespace Nucleus.Integrations.Unity.Transports
             if (!SelfSignedCertificate.TryReadValidity(certificateBytes, out DateTime notBefore, out DateTime notAfter))
             {
                 Logger<QuicSession>.LogError($"The server at [{_authority}] presented a pinned certificate whose validity could not be read.");
+
+                return false;
+            }
+
+            if (_pinnedCertificateValidityLimitEnabled && notAfter - notBefore > MaximumPinnedCertificateValidityPeriod)
+            {
+                Logger<QuicSession>.LogError($"The server at [{_authority}] presented a pinned certificate valid for [{(notAfter - notBefore).TotalDays:0.##}] days, past the [{MaximumPinnedCertificateValidityPeriod.TotalDays}] a browser accepts. Give the server a certificate valid for [{MaximumPinnedCertificateValidityPeriod.TotalDays}] days or less, or turn off [{nameof(Quic.PinnedCertificateValidityLimitEnabled)}].");
 
                 return false;
             }

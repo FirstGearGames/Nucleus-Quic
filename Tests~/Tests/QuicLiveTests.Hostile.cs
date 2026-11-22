@@ -222,11 +222,33 @@ public partial class QuicLiveTests
     }
 
     /// <summary>
-    /// A client pinning the hash of a certificate valid for longer than the two weeks a browser allows such a certificate is refused, as a
-    /// browser refuses it.
+    /// A client holding pinned certificates to the browser's limit refuses one valid for longer than the two weeks a browser allows such a
+    /// certificate, as a browser refuses it.
     /// </summary>
-    [Fact(Timeout = 60000, Skip = "Held for Ben: refusing a pinned certificate valid for more than 14 days breaks a native-only game pinning a long-lived certificate file.")]
+    [Fact(Timeout = 60000)]
     public async Task LiveWebTransport_AClientPinningACertificateValidForAMonth_IsRefused()
+    {
+        using X509Certificate2 certificate = CreateRawServerCertificate(DateTimeOffset.UtcNow.AddHours(-1), DateTimeOffset.UtcNow.AddDays(30));
+        await using QuicListener hostileListener = await ListenRawServerAsync(certificate);
+        Task<(QuicConnection Connection, QuicStream ConnectStream)?> answeringTask = AcceptAndAnswerConnectAsync(hostileListener);
+        (CoreManager client, Quic clientTransport) = await ConnectClientAsync((ushort)hostileListener.LocalEndPoint.Port, Convert.ToHexString(SHA256.HashData(certificate.RawData)), isPinnedCertificateValidityLimitEnabled: true);
+
+        await DriveUntilAsync(client, client, () => clientTransport.ClientSocket.State is LocalConnectionState.Connected or LocalConnectionState.Disconnected);
+
+        LocalConnectionState clientState = clientTransport.ClientSocket.State;
+
+        await clientTransport.ShutdownAsync();
+        await DisposeAnsweredConnectionAsync(answeringTask);
+
+        Assert.True(clientState is LocalConnectionState.Disconnected, $"The client reached [{clientState}] with a server whose pinned certificate is valid for 30 days, while holding pinned certificates to 14.");
+    }
+
+    /// <summary>
+    /// A client left as it starts out accepts a pinned certificate valid for a month, so a native game pinning a long-lived certificate file
+    /// keeps connecting; only a browser, or a client that turns the limit on, holds such a certificate to two weeks.
+    /// </summary>
+    [Fact(Timeout = 60000)]
+    public async Task LiveWebTransport_AClientPinningACertificateValidForAMonth_ConnectsByDefault()
     {
         using X509Certificate2 certificate = CreateRawServerCertificate(DateTimeOffset.UtcNow.AddHours(-1), DateTimeOffset.UtcNow.AddDays(30));
         await using QuicListener hostileListener = await ListenRawServerAsync(certificate);
@@ -240,7 +262,29 @@ public partial class QuicLiveTests
         await clientTransport.ShutdownAsync();
         await DisposeAnsweredConnectionAsync(answeringTask);
 
-        Assert.True(clientState is LocalConnectionState.Disconnected, $"The client reached [{clientState}] with a server whose pinned certificate is valid for 30 days.");
+        Assert.True(clientState is LocalConnectionState.Connected, $"The client reached [{clientState}] with a server whose pinned certificate is valid for 30 days, while accepting long-lived pinned certificates.");
+    }
+
+    /// <summary>
+    /// A client holding pinned certificates to the browser's limit still connects to a server's own certificate, which is made valid for
+    /// 13 days to pass that limit.
+    /// </summary>
+    [Fact(Timeout = 60000)]
+    public async Task LiveWebTransport_AClientHoldingPinnedCertificatesToTwoWeeks_ConnectsToTheServersOwnCertificate()
+    {
+        ushort port = ProbeFreeUdpPort();
+        (CoreManager server, Quic serverTransport) = await StartServerAsync(port);
+        (CoreManager client, Quic clientTransport) = await ConnectClientAsync(port, serverTransport.ServerCertificateHash, isPinnedCertificateValidityLimitEnabled: true);
+
+        await DriveUntilAsync(server, client, () => IsClientAuthenticated(client) || clientTransport.ClientSocket.State is LocalConnectionState.Disconnected);
+
+        bool isClientAuthenticated = IsClientAuthenticated(client);
+        LocalConnectionState clientState = clientTransport.ClientSocket.State;
+
+        await clientTransport.ShutdownAsync();
+        await serverTransport.ShutdownAsync();
+
+        Assert.True(isClientAuthenticated, $"A client holding pinned certificates to 14 days reached [{clientState}] without authenticating, while pinning the server's own 13-day certificate.");
     }
 
     /// <summary>

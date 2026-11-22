@@ -65,6 +65,15 @@ namespace Nucleus.Integrations.Unity.Transports
         /// </remarks>
         public string CertificateHash = string.Empty;
         /// <summary>
+        /// Whether a client refuses a pinned certificate valid for more than 14 days in total, as a browser does.
+        /// </summary>
+        /// <remarks>
+        /// Read when the client connects, and only applied when <see cref="CertificateHash"/> is set. Off by default, so a native game can pin
+        /// a long-lived certificate file and keep the same hash. Turn it on when the game also ships a WebGL build, so a certificate a browser
+        /// would refuse is refused on every platform. A browser applies the limit whatever this holds.
+        /// </remarks>
+        public bool PinnedCertificateValidityLimitEnabled;
+        /// <summary>
         /// The largest reliable packet the server accepts from a client; a client that sends a larger one is disconnected.
         /// </summary>
         /// <remarks>Read when the server starts. It bounds the memory one client can make the server hold for a packet it has not finished sending.</remarks>

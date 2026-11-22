@@ -336,7 +336,7 @@ namespace Nucleus.Integrations.Unity.Transports
                 return false;
 
             QuicSession quicSession = null;
-            bool isStarted = TryLoadClientCredential(quicConfiguration, pinnedCertificateHash is not null) && QuicSession.TryConnect(_msQuic, _events, quicConfiguration, quic.RemoteHost, quic.RemotePort, pinnedCertificateHash, out quicSession);
+            bool isStarted = TryLoadClientCredential(quicConfiguration, pinnedCertificateHash is not null) && QuicSession.TryConnect(_msQuic, _events, quicConfiguration, quic.RemoteHost, quic.RemotePort, pinnedCertificateHash, quic.PinnedCertificateValidityLimitEnabled, out quicSession);
 
             // A started connection holds its own reference to the configuration, so it is let go of either way.
             _msQuic.ConfigurationClose(quicConfiguration);
