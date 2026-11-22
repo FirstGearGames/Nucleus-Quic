@@ -285,9 +285,19 @@ namespace Nucleus.Integrations.Unity.Transports
         internal const int StreamShutdownAbortFlag = 0x6;
 
         /// <summary>
+        /// Closes the receiving direction of a stream at once, asking the peer to stop sending on it.
+        /// </summary>
+        internal const int StreamShutdownAbortReceiveFlag = 0x4;
+
+        /// <summary>
         /// Starts a stream with the bytes being sent.
         /// </summary>
         internal const int SendStartFlag = 0x2;
+
+        /// <summary>
+        /// Marks the bytes being sent as the last on the stream, closing its sending direction cleanly once they are delivered.
+        /// </summary>
+        internal const int SendFinFlag = 0x4;
 
         /// <summary>
         /// Marks received stream data as the last the peer will send.

@@ -12,6 +12,7 @@ using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Nucleus.Connections;
 using Nucleus.Managers.Core;
@@ -31,6 +32,19 @@ public partial class QuicLiveTests
     /// How long a test waits on something MsQuic does on its own threads before it fails.
     /// </summary>
     private static readonly TimeSpan BackgroundWaitTimeout = TimeSpan.FromSeconds(10);
+    /// <summary>
+    /// <see cref="AllowedOrigin"/> Huffman coded, as a browser's QPACK encoder writes an origin because that is shorter.
+    /// </summary>
+    private static readonly byte[] HuffmanCodedAllowedOrigin = [0x9D, 0x29, 0xAD, 0x17, 0x18, 0x60, 0x74, 0x50, 0x7F, 0x05, 0x91, 0x72, 0xF9, 0x1D, 0x35, 0xD0, 0x5F];
+    /// <summary>
+    /// <see cref="OtherOrigin"/> Huffman coded.
+    /// </summary>
+    private static readonly byte[] HuffmanCodedOtherOrigin = [0x9D, 0x29, 0xAD, 0x17, 0x18, 0x60, 0xE9, 0x9C, 0xB6, 0x2E, 0x5F, 0x23, 0xA6, 0xBA, 0x0B];
+    /// <summary>
+    /// What this transport's server answers a CONNECT from an origin it does not list with: a HEADERS frame four bytes long, the field
+    /// section's two prefix bytes, then <c>:status 403</c> as static entry 68, which runs past the index's 6-bit prefix into a second byte.
+    /// </summary>
+    private static readonly byte[] ForbiddenResponseFrame = [0x01, 0x04, 0x00, 0x00, 0xFF, 0x05];
     /// <summary>
     /// The largest reliable packet a server under attack allows, small so a flood passes it quickly.
     /// </summary>
@@ -67,6 +81,14 @@ public partial class QuicLiveTests
     /// The HTTP/3 error code for a request abandoned by the side that made it.
     /// </summary>
     private const long RequestCancelledErrorCode = 0x10C;
+    /// <summary>
+    /// The origin a test server lists, as a browser names the page a connection was opened from.
+    /// </summary>
+    private const string AllowedOrigin = "https://allowed.example";
+    /// <summary>
+    /// An origin no test server lists.
+    /// </summary>
+    private const string OtherOrigin = "https://other.example";
 
     /// <summary>
     /// A client whose last packet, departure and successor's arrival all reach the server in one pass has that packet read as its own or
@@ -292,6 +314,115 @@ public partial class QuicLiveTests
 
         await quicConnection.CloseAsync(NoErrorCode);
         await serverTransport.ShutdownAsync();
+    }
+
+    /// <summary>
+    /// A CONNECT naming a page whose origin the server does not list is answered with 403 rather than a session, however the origin is
+    /// written, so another site's page cannot reach the server through a visitor's browser.
+    /// </summary>
+    /// <param name="originFieldLineForm">How the request writes its origin.</param>
+    [Theory(Timeout = 60000)]
+    [InlineData(OriginFieldLineForm.StaticNameHuffmanCodedValue)]
+    [InlineData(OriginFieldLineForm.StaticNamePlainValue)]
+    [InlineData(OriginFieldLineForm.HuffmanCodedLiteralName)]
+    public async Task LiveWebTransport_AConnectFromAnOriginNotListed_IsRefusedWith403(OriginFieldLineForm originFieldLineForm)
+    {
+        ushort port = ProbeFreeUdpPort();
+        (_, Quic serverTransport) = await CreateServerAsync(port);
+        serverTransport.AllowedOrigins = [AllowedOrigin];
+
+        Assert.Equal(ConnectionStateChangeResult.Success, await serverTransport.ConnectAsync(Invoker.Server));
+
+        await using QuicConnection hostileConnection = await ConnectRawClientAsync(port);
+        await using QuicStream requestStream = await hostileConnection.OpenOutboundStreamAsync(QuicStreamType.Bidirectional);
+
+        await requestStream.WriteAsync(CreateConnectRequestFrame([.. CreatePlainProtocolFieldLine("webtransport"), .. CreateOriginFieldLine(originFieldLineForm, OtherOrigin, HuffmanCodedOtherOrigin)]));
+
+        byte[] responseFrame = await ReadResponseFrameAsync(requestStream);
+        bool isResponseFinished = await IsStreamFinishedAsync(requestStream);
+
+        await hostileConnection.CloseAsync(NoErrorCode);
+        await serverTransport.ShutdownAsync();
+
+        Assert.Equal(ForbiddenResponseFrame, responseFrame);
+        Assert.True(isResponseFinished, "The server left the stream open after answering a CONNECT from an origin it does not list.");
+    }
+
+    /// <summary>
+    /// A CONNECT naming a page whose origin the server lists is accepted, however the origin is written, the list being matched whatever
+    /// letter case it was written in and past its first entry.
+    /// </summary>
+    /// <param name="originFieldLineForm">How the request writes its origin.</param>
+    [Theory(Timeout = 60000)]
+    [InlineData(OriginFieldLineForm.StaticNameHuffmanCodedValue)]
+    [InlineData(OriginFieldLineForm.StaticNamePlainValue)]
+    [InlineData(OriginFieldLineForm.HuffmanCodedLiteralName)]
+    public async Task LiveWebTransport_AConnectFromAListedOrigin_IsAccepted(OriginFieldLineForm originFieldLineForm)
+    {
+        ushort port = ProbeFreeUdpPort();
+        (_, Quic serverTransport) = await CreateServerAsync(port);
+        serverTransport.AllowedOrigins = ["https://game.example", "HTTPS://Allowed.Example"];
+
+        Assert.Equal(ConnectionStateChangeResult.Success, await serverTransport.ConnectAsync(Invoker.Server));
+
+        await using QuicConnection quicConnection = await ConnectRawClientAsync(port);
+        await using QuicStream requestStream = await quicConnection.OpenOutboundStreamAsync(QuicStreamType.Bidirectional);
+
+        await requestStream.WriteAsync(CreateConnectRequestFrame([.. CreatePlainProtocolFieldLine("webtransport"), .. CreateOriginFieldLine(originFieldLineForm, AllowedOrigin, HuffmanCodedAllowedOrigin)]));
+
+        bool isConnectAccepted = await IsConnectAcceptedAsync(requestStream);
+
+        await quicConnection.CloseAsync(NoErrorCode);
+        await serverTransport.ShutdownAsync();
+
+        Assert.True(isConnectAccepted, $"The server refused a CONNECT from [{AllowedOrigin}], written as [{originFieldLineForm}], while listing it as [HTTPS://Allowed.Example].");
+    }
+
+    /// <summary>
+    /// A native client, which names no origin, connects to a server that lists the pages a browser may connect from.
+    /// </summary>
+    [Fact(Timeout = 60000)]
+    public async Task LiveWebTransport_ANativeClientNamingNoOrigin_ConnectsToAServerListingOrigins()
+    {
+        ushort port = ProbeFreeUdpPort();
+        (CoreManager server, Quic serverTransport) = await CreateServerAsync(port);
+        serverTransport.AllowedOrigins = [AllowedOrigin];
+
+        Assert.Equal(ConnectionStateChangeResult.Success, await serverTransport.ConnectAsync(Invoker.Server));
+
+        (CoreManager client, Quic clientTransport) = await ConnectClientAsync(port, serverTransport.ServerCertificateHash);
+
+        await DriveUntilAsync(server, client, () => IsClientAuthenticated(client) || clientTransport.ClientSocket.State is LocalConnectionState.Disconnected);
+
+        bool isClientAuthenticated = IsClientAuthenticated(client);
+        LocalConnectionState clientState = clientTransport.ClientSocket.State;
+
+        await clientTransport.ShutdownAsync();
+        await serverTransport.ShutdownAsync();
+
+        Assert.True(isClientAuthenticated, $"A native client naming no origin reached [{clientState}] without authenticating, with a server listing [{AllowedOrigin}].");
+    }
+
+    /// <summary>
+    /// A server that lists no origins, as it starts out, accepts a CONNECT naming any page, so a game that never sets the list is unchanged.
+    /// </summary>
+    [Fact(Timeout = 60000)]
+    public async Task LiveWebTransport_AConnectFromAnyOrigin_IsAcceptedWhenNoOriginsAreListed()
+    {
+        ushort port = ProbeFreeUdpPort();
+        (_, Quic serverTransport) = await StartServerAsync(port);
+
+        await using QuicConnection quicConnection = await ConnectRawClientAsync(port);
+        await using QuicStream requestStream = await quicConnection.OpenOutboundStreamAsync(QuicStreamType.Bidirectional);
+
+        await requestStream.WriteAsync(CreateConnectRequestFrame([.. CreatePlainProtocolFieldLine("webtransport"), .. CreateOriginFieldLine(OriginFieldLineForm.StaticNameHuffmanCodedValue, OtherOrigin, HuffmanCodedOtherOrigin)]));
+
+        bool isConnectAccepted = await IsConnectAcceptedAsync(requestStream);
+
+        await quicConnection.CloseAsync(NoErrorCode);
+        await serverTransport.ShutdownAsync();
+
+        Assert.True(isConnectAccepted, $"A server listing no origins refused a CONNECT from [{OtherOrigin}].");
     }
 
     /// <summary>
@@ -615,18 +746,21 @@ public partial class QuicLiveTests
 
     /// <summary>
     /// Builds a CONNECT request's HEADERS frame as a browser lays one out: <c>:method CONNECT</c> and <c>:scheme https</c> as static
-    /// entries, <c>:authority</c> and <c>:path</c> as static names with plain values, then the protocol field line given.
+    /// entries, <c>:authority</c> and <c>:path</c> as static names with plain values, then the field lines given.
     /// </summary>
-    /// <param name="protocolFieldLine">The encoded <c>:protocol</c> field line, or empty for none.</param>
+    /// <param name="fieldLines">The encoded field lines that follow, such as the <c>:protocol</c> line, or empty for none.</param>
     /// <returns>The frame.</returns>
-    private static byte[] CreateConnectRequestFrame(byte[] protocolFieldLine)
+    private static byte[] CreateConnectRequestFrame(byte[] fieldLines)
     {
         byte[] authority = Encoding.ASCII.GetBytes("localhost:7777");
-        List<byte> fieldSection = [0x00, 0x00, 0xCF, 0xD7, 0x50, (byte)authority.Length, .. authority, 0x51, 0x01, (byte)'/', .. protocolFieldLine];
+        List<byte> fieldSection = [0x00, 0x00, 0xCF, 0xD7, 0x50, (byte)authority.Length, .. authority, 0x51, 0x01, (byte)'/', .. fieldLines];
 
-        Assert.True(fieldSection.Count < 64, "The field section must fit a one-byte length.");
+        Assert.True(fieldSection.Count < 1 << 14, "The field section must fit a two-byte length.");
 
-        return [0x01, (byte)fieldSection.Count, .. fieldSection];
+        // A one-byte length below 64, otherwise a two-byte one whose top bits are 01.
+        byte[] frameLength = fieldSection.Count < 64 ? [(byte)fieldSection.Count] : [(byte)(0x40 | fieldSection.Count >> 8), (byte)fieldSection.Count];
+
+        return [0x01, .. frameLength, .. fieldSection];
     }
 
     /// <summary>
@@ -635,6 +769,22 @@ public partial class QuicLiveTests
     /// <param name="protocol">The protocol named, shorter than 127 characters.</param>
     /// <returns>The field line.</returns>
     private static byte[] CreatePlainProtocolFieldLine(string protocol) => [0x27, 0x02, .. Encoding.ASCII.GetBytes(":protocol"), (byte)protocol.Length, .. Encoding.ASCII.GetBytes(protocol)];
+
+    /// <summary>
+    /// Encodes an <c>origin</c> field line in one of the forms a QPACK encoder may write it in.
+    /// </summary>
+    /// <param name="originFieldLineForm">The form.</param>
+    /// <param name="origin">The origin, shorter than 127 characters.</param>
+    /// <param name="huffmanCodedOrigin">The same origin Huffman coded.</param>
+    /// <returns>The field line.</returns>
+    private static byte[] CreateOriginFieldLine(OriginFieldLineForm originFieldLineForm, string origin, byte[] huffmanCodedOrigin) => originFieldLineForm switch
+    {
+        // A literal naming static entry 90, origin, as 01, never-indexed clear, static, then 90 past the index's 4-bit prefix of 15.
+        OriginFieldLineForm.StaticNameHuffmanCodedValue => [0x5F, 0x4B, (byte)(0x80 | huffmanCodedOrigin.Length), .. huffmanCodedOrigin],
+        OriginFieldLineForm.StaticNamePlainValue => [0x5F, 0x4B, (byte)origin.Length, .. Encoding.ASCII.GetBytes(origin)],
+        // A literal name with the Huffman bit and a length of five, origin; then the value, Huffman coded.
+        _ => [0x2D, 0x3D, 0x86, 0x98, 0xD5, 0x7F, (byte)(0x80 | huffmanCodedOrigin.Length), .. huffmanCodedOrigin],
+    };
 
     /// <summary>
     /// Reads what a server answers a CONNECT with.
@@ -666,6 +816,54 @@ public partial class QuicLiveTests
         }
 
         return response[0] == 0x01 && response[4] == 0xD9;
+    }
+
+    /// <summary>
+    /// Reads the first frame a server answers a CONNECT with.
+    /// </summary>
+    /// <param name="requestStream">The stream the CONNECT was sent on.</param>
+    /// <returns>The frame, or empty when the server ended or reset the stream before sending a whole one.</returns>
+    /// <remarks>Every frame this transport's server answers a CONNECT with is shorter than 64 bytes, so its length takes one byte.</remarks>
+    private static async Task<byte[]> ReadResponseFrameAsync(QuicStream requestStream)
+    {
+        byte[] response = new byte[2 + byte.MaxValue];
+
+        try
+        {
+            // The frame type and its length, then exactly that many bytes, so nothing past the frame is read.
+            if (await requestStream.ReadAtLeastAsync(response.AsMemory(0, 2), minimumBytes: 2, throwOnEndOfStream: false) < 2)
+                return [];
+
+            int payloadLength = response[1];
+
+            if (await requestStream.ReadAtLeastAsync(response.AsMemory(2, payloadLength), minimumBytes: payloadLength, throwOnEndOfStream: false) < payloadLength)
+                return [];
+
+            return response[..(2 + payloadLength)];
+        }
+        catch (QuicException)
+        {
+            return [];
+        }
+    }
+
+    /// <summary>
+    /// Returns whether a peer has finished sending on a stream, waiting for it up to <see cref="BackgroundWaitTimeout"/>.
+    /// </summary>
+    /// <param name="quicStream">The stream, with everything the peer sent before finishing already read.</param>
+    /// <returns>True when the peer finished the stream cleanly; false when it sent more, reset the stream, or left it open.</returns>
+    private static async Task<bool> IsStreamFinishedAsync(QuicStream quicStream)
+    {
+        using CancellationTokenSource cancellationTokenSource = new(BackgroundWaitTimeout);
+
+        try
+        {
+            return await quicStream.ReadAsync(new byte[1], cancellationTokenSource.Token) == 0;
+        }
+        catch (Exception exception) when (exception is QuicException or OperationCanceledException)
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -827,5 +1025,24 @@ public partial class QuicLiveTests
         }
 
         return readEvents;
+    }
+
+    /// <summary>
+    /// How a test's CONNECT writes its <c>origin</c> field line.
+    /// </summary>
+    public enum OriginFieldLineForm : byte
+    {
+        /// <summary>
+        /// The name as the static table entry for <c>origin</c> and the value Huffman coded, which is how a browser writes it.
+        /// </summary>
+        StaticNameHuffmanCodedValue = 0,
+        /// <summary>
+        /// The name as the static table entry and the value as plain ASCII.
+        /// </summary>
+        StaticNamePlainValue = 1,
+        /// <summary>
+        /// The name and the value both as Huffman coded literals.
+        /// </summary>
+        HuffmanCodedLiteralName = 2,
     }
 }

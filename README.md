@@ -48,6 +48,7 @@ A host's own client, pointed at this machine on the server's port, joins its ser
 | Maximum Connections | 0 | Server only. The most clients the server accepts at once. 0 accepts any number. Connections past twice this, counting those still opening, are refused at their handshake. |
 | Maximum Transmission Unit | 1200 | The largest packet built before it is split. Keep it at 1200 unless every network path is known to carry more. |
 | Maximum Reliable Packet Size | 1048576 | Server only. The largest reliable packet, in bytes, a client may send. A client that sends a larger one is disconnected. |
+| Allowed Origins | empty | Server only. The web pages a browser may connect from, such as `https://game.example.com`. Empty accepts every page. Native clients are always accepted. See [Allowed origins](#allowed-origins). |
 | Connecting Timeout Seconds | 10 | How long a client waits for the server to answer, and how long the server gives a new connection to open its session before closing it. 0 uses the idle timeout. |
 | Idle Timeout Seconds | 15 | How long either side waits without hearing from the other before dropping the link. |
 
@@ -61,11 +62,20 @@ A browser only connects to a server whose certificate it trusts. There are two w
 
 **A certificate from a public authority.** Put the certificate and its private key in a `.pfx` file, set **Certificate Path** and **Certificate Password** on the server, and point clients at the domain the certificate names. Clients leave **Certificate Hash** empty.
 
+## Allowed origins
+
+A browser tells the server which web page opened each connection, and the page cannot change what the browser says. Without a list, any website's page can connect to your server through the browsers of the people visiting it.
+
+To accept only your own pages, add each one to **Allowed Origins** on the server, written the way a browser names a page: the scheme, the host, and the port when it is not the scheme's default. For example, `https://game.example.com`, or `http://localhost:8080` for a build you test locally. Letter case does not matter. Leave out any path, such as `/play`. A browser on any other page sees its connection fail. Leave the list empty to accept every page, which is the default.
+
+Native clients do not name a page, so they connect whatever the list holds. The list stops other websites, not other programs, which can claim to be any page they like, so it does not replace authentication.
+
 ## Things that look like bugs but are not
 
 - **The server's certificate hash changes every restart.** A certificate the server makes itself is new each time. Use a certificate file when clients need a hash that stays the same.
 - **On Windows, a key is written to the user's key store as the server starts.** Windows' TLS runs in a system process that can only load a stored key. The server deletes it again as soon as that process has loaded it.
 - **A browser client drops at once when its tab closes.** A browser cannot wait for its last packets to be acknowledged. A server kick does wait, so the kick reason arrives.
+- **Browsers cannot connect while desktop clients can.** When the server lists **Allowed Origins**, the page must be listed exactly as the browser names it, with its port when that is not the default. The server does not log these refusals, so a page that keeps trying cannot fill the log.
 
 ## Tests
 

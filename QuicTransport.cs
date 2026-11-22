@@ -131,6 +131,12 @@ namespace Nucleus.Integrations.Unity.Transports
         [Tooltip("Server only. Largest reliable packet in bytes a client may send; a client that sends a larger one is disconnected.")]
         private int _maximumReliablePacketSize = 1024 * 1024;
         /// <summary>
+        /// The origins of the web pages a browser may connect from, or empty to accept every page.
+        /// </summary>
+        [SerializeField]
+        [Tooltip("Server only. Origins of the web pages a browser may connect from, such as https://game.example.com. Empty accepts every page. Native clients name no page and are always accepted.")]
+        private string[] _allowedOrigins = new string[0];
+        /// <summary>
         /// Seconds a client waits for the server to answer a connect, and a server waits for a new connection to open its session.
         /// </summary>
         [SerializeField]
@@ -161,6 +167,7 @@ namespace Nucleus.Integrations.Unity.Transports
             _quic.CertificateHash = _certificateHash;
             _quic.SetMaximumConnections(_maximumConnections);
             _quic.MaximumReliablePacketSize = _maximumReliablePacketSize;
+            _quic.AllowedOrigins = _allowedOrigins;
             _quic.Configuration.MaximumTransmissionUnit = _maximumTransmissionUnit;
             _quic.Configuration.ConnectingTimeoutSeconds = _connectingTimeoutSeconds;
             _quic.Configuration.ConnectedTimeoutSeconds = _idleTimeoutSeconds;

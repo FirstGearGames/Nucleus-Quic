@@ -13,8 +13,9 @@ namespace Nucleus.Integrations.Unity.Transports
     /// Only what one session per connection needs is spoken. Header blocks are QPACK with the static table alone, which the SETTINGS
     /// advertise by leaving the dynamic table at its default size of zero, so a peer may only refer to static entries or send literals.
     /// Literals this side writes are never Huffman coded, and literals a peer writes are compared rather than decoded: the only facts read
-    /// from a header block are the method and protocol of a request and the status of a response. Every browser sends the method and the
-    /// status as static entries; the protocol has no entry, so it is compared against both its plain and its Huffman coding.
+    /// from a header block are the method, protocol and origin of a request and the status of a response. Every browser sends the method
+    /// and the status as static entries; the protocol has no entry and an origin's value is a literal, so each is compared against both its
+    /// plain and its Huffman coding, an allowed origin's coding being made once when the server starts.
     /// </para>
     /// <para>
     /// Draft 02 of WebTransport over HTTP/3, which Chrome and Firefox speak, and drafts 07 onwards, which Safari speaks, are both offered.
@@ -48,6 +49,25 @@ namespace Nucleus.Integrations.Unity.Transports
         /// </summary>
         private static ReadOnlySpan<byte> HuffmanCodedWebTransportProtocol => new byte[] { 0xF0, 0x58, 0xD3, 0x60, 0xEA, 0x45, 0x67, 0xB1, 0x3F };
         /// <summary>
+        /// <see cref="OriginFieldName"/> Huffman coded, for an encoder that writes the name as a literal rather than as its static entry.
+        /// </summary>
+        private static ReadOnlySpan<byte> HuffmanCodedOriginFieldName => new byte[] { 0x3D, 0x86, 0x98, 0xD5, 0x7F };
+        /// <summary>
+        /// How many bits each byte value takes in the Huffman code HPACK and QPACK share, indexed by the byte.
+        /// </summary>
+        /// <remarks>The code is canonical, so these lengths alone define it, and <see cref="CreateHuffmanCoding"/> rebuilds the codes from them.</remarks>
+        private static ReadOnlySpan<byte> HuffmanCodeLengths => new byte[]
+        {
+            13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 28,
+            6, 10, 10, 12, 13, 6, 8, 11, 10, 10, 8, 11, 8, 6, 6, 6, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 8, 15, 6, 12, 10,
+            13, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 8, 13, 19, 13, 14, 6,
+            15, 5, 6, 5, 6, 5, 6, 6, 6, 5, 7, 7, 6, 6, 6, 5, 6, 7, 6, 5, 5, 6, 7, 7, 7, 7, 7, 15, 11, 14, 13, 28,
+            20, 22, 20, 20, 22, 22, 22, 23, 22, 23, 23, 23, 23, 23, 24, 23, 24, 24, 22, 23, 24, 23, 23, 23, 23, 21, 22, 23, 22, 23, 23, 24,
+            22, 21, 20, 22, 22, 23, 23, 21, 23, 22, 22, 24, 21, 22, 23, 23, 21, 21, 22, 21, 23, 22, 23, 23, 20, 22, 22, 22, 23, 22, 22, 23,
+            26, 26, 20, 19, 22, 23, 22, 25, 26, 26, 26, 27, 27, 26, 24, 25, 19, 21, 26, 27, 27, 26, 27, 24, 21, 21, 26, 26, 28, 27, 27, 27,
+            20, 24, 20, 21, 22, 21, 21, 23, 22, 22, 25, 25, 24, 24, 26, 23, 26, 27, 26, 26, 27, 27, 27, 27, 27, 28, 27, 27, 27, 27, 27, 26,
+        };
+        /// <summary>
         /// The field an extended CONNECT names its protocol in, which no QPACK static table entry names.
         /// </summary>
         private const string ProtocolFieldName = ":protocol";
@@ -55,6 +75,10 @@ namespace Nucleus.Integrations.Unity.Transports
         /// The protocol a CONNECT opening a WebTransport session names.
         /// </summary>
         private const string WebTransportProtocol = "webtransport";
+        /// <summary>
+        /// The field a browser names the page that opened a request in.
+        /// </summary>
+        private const string OriginFieldName = "origin";
         /// <summary>
         /// The HEADERS frame type.
         /// </summary>
@@ -123,6 +147,18 @@ namespace Nucleus.Integrations.Unity.Transports
         /// The QPACK static table entry named <c>:path</c>.
         /// </summary>
         private const int PathStaticIndex = 1;
+        /// <summary>
+        /// The QPACK static table entry for <c>:status 403</c>.
+        /// </summary>
+        private const int ForbiddenStatusStaticIndex = 68;
+        /// <summary>
+        /// The QPACK static table entry named <c>origin</c>, whose value is empty.
+        /// </summary>
+        private const int OriginStaticIndex = 90;
+        /// <summary>
+        /// The most bits a byte takes in the Huffman code.
+        /// </summary>
+        private const int MaximumHuffmanCodeLength = 30;
 
         /// <summary>
         /// Returns how many bytes a value takes as a variable-length integer.
@@ -287,6 +323,22 @@ namespace Nucleus.Integrations.Unity.Transports
         }
 
         /// <summary>
+        /// Creates the response that refuses a WebTransport session to a page the server does not allow: <c>:status 403</c>.
+        /// </summary>
+        /// <returns>The HEADERS frame.</returns>
+        internal static byte[] CreateForbiddenResponse()
+        {
+            byte[] fieldSection = new byte[8];
+            int length = 0;
+
+            fieldSection[length++] = 0x00;
+            fieldSection[length++] = 0x00;
+            WritePrefixedInteger(fieldSection, ref length, 0xC0, prefixBits: 6, ForbiddenStatusStaticIndex);
+
+            return CreateHeadersFrame(fieldSection, length);
+        }
+
+        /// <summary>
         /// Creates what opens a two-way WebTransport stream: the signal, the session, and one empty frame so the peer hears of the stream
         /// before anything else is sent on it.
         /// </summary>
@@ -302,6 +354,62 @@ namespace Nucleus.Integrations.Unity.Transports
             header[offset++] = 0x00;
 
             return Trim(header, offset);
+        }
+
+        /// <summary>
+        /// Huffman codes a string literal, as a QPACK encoder codes one when that is shorter.
+        /// </summary>
+        /// <param name="value">The literal's bytes.</param>
+        /// <returns>The coded bytes, the last padded with ones, which begin the end-of-string code.</returns>
+        /// <remarks>
+        /// A string has exactly one Huffman coding, so a literal a peer coded is compared with this as bytes, without decoding it. Called as a
+        /// server starts, so the codes are rebuilt for each call rather than held.
+        /// </remarks>
+        internal static byte[] CreateHuffmanCoding(byte[] value)
+        {
+            ReadOnlySpan<byte> codeLengths = HuffmanCodeLengths;
+            Span<uint> codes = stackalloc uint[codeLengths.Length];
+            uint nextCode = 0;
+
+            // Taken by length, then by value within a length, each byte has the code after the one before it.
+            for (int codeLength = 1; codeLength <= MaximumHuffmanCodeLength; codeLength++)
+            {
+                for (int i = 0; i < codeLengths.Length; i++)
+                {
+                    if (codeLengths[i] == codeLength)
+                        codes[i] = nextCode++;
+                }
+
+                nextCode <<= 1;
+            }
+
+            int bitCount = 0;
+
+            foreach (byte valueByte in value)
+                bitCount += codeLengths[valueByte];
+
+            byte[] coded = new byte[(bitCount + 7) / 8];
+            ulong pendingBits = 0;
+            int pendingBitCount = 0;
+            int offset = 0;
+
+            // Bits already written stay above the pending ones until they shift out of the top; the cast to a byte drops them, so they need no masking.
+            foreach (byte valueByte in value)
+            {
+                pendingBits = pendingBits << codeLengths[valueByte] | codes[valueByte];
+                pendingBitCount += codeLengths[valueByte];
+
+                while (pendingBitCount >= 8)
+                {
+                    pendingBitCount -= 8;
+                    coded[offset++] = (byte)(pendingBits >> pendingBitCount);
+                }
+            }
+
+            if (pendingBitCount > 0)
+                coded[offset] = (byte)(pendingBits << (8 - pendingBitCount) | 0xFFUL >> pendingBitCount);
+
+            return coded;
         }
 
         /// <summary>
@@ -358,6 +466,81 @@ namespace Nucleus.Integrations.Unity.Transports
         /// <param name="end">Where it ends.</param>
         /// <returns>True for a response accepting the session.</returns>
         internal static bool IsOkResponse(byte[] source, int offset, int end) => HasField(source, offset, end, StatusOkStaticIndex, FirstStatusStaticIndex, LastStatusStaticIndex, "200");
+
+        /// <summary>
+        /// Returns whether every <c>origin</c> a request's field section names is an allowed origin, a request naming none counting as allowed.
+        /// </summary>
+        /// <param name="source">The bytes holding the field section.</param>
+        /// <param name="offset">Where the field section starts.</param>
+        /// <param name="end">Where it ends.</param>
+        /// <param name="plainAllowedOrigins">Each allowed origin as lowercase ASCII.</param>
+        /// <param name="huffmanCodedAllowedOrigins">The same origins Huffman coded, by <see cref="CreateHuffmanCoding"/>.</param>
+        /// <returns>True when the request may open a session.</returns>
+        /// <remarks>
+        /// Deliberately parallel to <see cref="HasWebTransportProtocol"/>, reading the field in every form an encoder may write it in: the
+        /// static entry naming it, which is how a browser writes it, or a literal name, plain or Huffman coded. A value is compared as it
+        /// arrived against the allowed origins coded the same way, so nothing is decoded or allocated; a browser names a page's scheme and
+        /// host in lower case. A field section that refers to the dynamic table is refused, since the origin could be hidden there.
+        /// </remarks>
+        internal static bool IsOriginAllowed(byte[] source, int offset, int end, byte[][] plainAllowedOrigins, byte[][] huffmanCodedAllowedOrigins)
+        {
+            if (!TryReadPrefixedInteger(source, ref offset, end, prefixBits: 8, out ulong requiredInsertCount) || requiredInsertCount != 0 || !TryReadPrefixedInteger(source, ref offset, end, prefixBits: 7, out _))
+                return false;
+
+            while (offset < end)
+            {
+                byte first = source[offset];
+
+                // An indexed field line: 1, static, then a 6-bit index. The static entry naming origin carries an empty value.
+                if ((first & 0x80) != 0)
+                {
+                    if ((first & 0x40) == 0 || !TryReadPrefixedInteger(source, ref offset, end, prefixBits: 6, out ulong index))
+                        return false;
+
+                    if (index == OriginStaticIndex && !IsListed(source, offset, 0, plainAllowedOrigins))
+                        return false;
+
+                    continue;
+                }
+
+                // A literal field line with a name reference: 01, never-indexed, static, then a 4-bit index.
+                if ((first & 0x40) != 0)
+                {
+                    if ((first & 0x10) == 0 || !TryReadPrefixedInteger(source, ref offset, end, prefixBits: 4, out ulong nameIndex) || !TrySkipStringLiteral(source, ref offset, end, out int valueOffset, out int valueLength, out bool isValueHuffmanCoded))
+                        return false;
+
+                    if (nameIndex == OriginStaticIndex && !IsListed(source, valueOffset, valueLength, isValueHuffmanCoded ? huffmanCodedAllowedOrigins : plainAllowedOrigins))
+                        return false;
+
+                    continue;
+                }
+
+                // A literal field line with a literal name: 001, never-indexed, Huffman, then a 3-bit name length.
+                if ((first & 0x20) != 0)
+                {
+                    bool isNameHuffmanCoded = (first & 0x08) != 0;
+
+                    if (!TryReadPrefixedInteger(source, ref offset, end, prefixBits: 3, out ulong nameLength) || (ulong)(end - offset) < nameLength)
+                        return false;
+
+                    int nameOffset = offset;
+                    offset += (int)nameLength;
+
+                    if (!TrySkipStringLiteral(source, ref offset, end, out int valueOffset, out int valueLength, out bool isValueHuffmanCoded))
+                        return false;
+
+                    if (IsStringLiteral(source, nameOffset, (int)nameLength, isNameHuffmanCoded, OriginFieldName, HuffmanCodedOriginFieldName) && !IsListed(source, valueOffset, valueLength, isValueHuffmanCoded ? huffmanCodedAllowedOrigins : plainAllowedOrigins))
+                        return false;
+
+                    continue;
+                }
+
+                // Both remaining forms refer to the dynamic table, which this endpoint advertised none of.
+                return false;
+            }
+
+            return true;
+        }
 
         /// <summary>
         /// Writes one setting with the value one.
@@ -657,6 +840,27 @@ namespace Nucleus.Integrations.Unity.Transports
         /// <param name="huffmanCodedValue">The value Huffman coded; a string has exactly one Huffman coding, so the bytes are compared as they are.</param>
         /// <returns>True when they match.</returns>
         private static bool IsStringLiteral(byte[] source, int offset, int length, bool isHuffmanCoded, string value, ReadOnlySpan<byte> huffmanCodedValue) => isHuffmanCoded ? source.AsSpan(offset, length).SequenceEqual(huffmanCodedValue) : IsAscii(source, offset, length, value);
+
+        /// <summary>
+        /// Returns whether a run of bytes is exactly one of a list of byte strings.
+        /// </summary>
+        /// <param name="source">The bytes.</param>
+        /// <param name="offset">Where the run starts.</param>
+        /// <param name="length">How long the run is.</param>
+        /// <param name="listedValues">The byte strings.</param>
+        /// <returns>True when one of them matches.</returns>
+        private static bool IsListed(byte[] source, int offset, int length, byte[][] listedValues)
+        {
+            ReadOnlySpan<byte> value = source.AsSpan(offset, length);
+
+            foreach (byte[] listedValue in listedValues)
+            {
+                if (value.SequenceEqual(listedValue))
+                    return true;
+            }
+
+            return false;
+        }
 
         /// <summary>
         /// Returns whether a run of bytes spells an ASCII string exactly.

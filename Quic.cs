@@ -69,6 +69,18 @@ namespace Nucleus.Integrations.Unity.Transports
         /// </summary>
         /// <remarks>Read when the server starts. It bounds the memory one client can make the server hold for a packet it has not finished sending.</remarks>
         public int MaximumReliablePacketSize = 1024 * 1024;
+        /// <summary>
+        /// The origins of the web pages a browser may connect from, such as <c>https://game.example.com</c>, or empty to accept a
+        /// connection from any page.
+        /// </summary>
+        /// <remarks>
+        /// Read when the server starts. A browser names the page that opened a connection, and the page cannot change what is named, so
+        /// listing the game's own pages stops another site's page from connecting through its visitors' browsers. Each entry is a scheme, a
+        /// host and a port only when it is not the scheme's default, as a browser names them; letter case does not matter. A native client
+        /// names no page and is accepted whatever the list holds, so the list guards against pages, not against programs, which can name
+        /// any page they like.
+        /// </remarks>
+        public string[] AllowedOrigins = Array.Empty<string>();
 
         /// <summary>
         /// The SHA-256 of the certificate the server made for itself on its last start, as 64 lowercase hex characters, or empty when it

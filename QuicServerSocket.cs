@@ -243,7 +243,7 @@ namespace Nucleus.Integrations.Unity.Transports
 
             Configuration configuration = quic.Configuration;
 
-            if (!QuicListener.TryStart(_msQuic, _events, certificate, quic.CertificatePassword, configuration.BindAddress, configuration.Port, configuration.ConnectingTimeoutSeconds, configuration.ConnectedTimeoutSeconds, quic.MaximumReliablePacketSize, Transport.ServerConfiguration.MaximumConnections, out _quicListener))
+            if (!QuicListener.TryStart(_msQuic, _events, certificate, quic.CertificatePassword, configuration.BindAddress, configuration.Port, configuration.ConnectingTimeoutSeconds, configuration.ConnectedTimeoutSeconds, quic.MaximumReliablePacketSize, Transport.ServerConfiguration.MaximumConnections, quic.AllowedOrigins, out _quicListener))
                 return GetResultTask(ConnectionStateChangeResult.UnspecifiedError);
 
             _isListening = true;

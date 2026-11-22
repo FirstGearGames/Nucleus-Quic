@@ -131,6 +131,10 @@ namespace Nucleus.Integrations.Unity.Transports
         /// </summary>
         private static readonly IntPtr StreamHandlerPointer = Marshal.GetFunctionPointerForDelegate(StreamHandler);
         /// <summary>
+        /// The response refusing a session to a page the server does not allow, made once so a refusal allocates nothing.
+        /// </summary>
+        private static readonly byte[] ForbiddenResponse = Http3.CreateForbiddenResponse();
+        /// <summary>
         /// The value of a stream identifier not yet known.
         /// </summary>
         private const long UnsetStreamId = -1;
@@ -575,7 +579,8 @@ namespace Nucleus.Integrations.Unity.Transports
         }
 
         /// <summary>
-        /// Reads a client's CONNECT once its headers are in, accepting the first that asks for WebTransport and refusing anything else.
+        /// Reads a client's CONNECT once its headers are in, accepting the first that asks for WebTransport from a page the server allows and
+        /// refusing anything else.
         /// </summary>
         /// <param name="stream">The request stream.</param>
         /// <param name="quicStream">What is kept about it.</param>
@@ -594,6 +599,13 @@ namespace Nucleus.Integrations.Unity.Transports
             if (_sessionId != UnsetStreamId || !Http3.IsWebTransportConnectRequest(quicStream.Buffer, fieldSectionOffset, fieldSectionEnd))
             {
                 RefuseRequest(stream, quicStream);
+
+                return;
+            }
+
+            if (!_quicListener.IsOriginAllowed(quicStream.Buffer, fieldSectionOffset, fieldSectionEnd))
+            {
+                RefuseForbiddenRequest(stream, quicStream);
 
                 return;
             }
@@ -841,6 +853,27 @@ namespace Nucleus.Integrations.Unity.Transports
             quicStream.Kind = QuicStreamKind.Ignored;
             quicStream.Count = 0;
             _msQuic.StreamShutdown(stream, MsQuic.StreamShutdownAbortFlag, MsQuic.RequestRejectedErrorCode);
+        }
+
+        /// <summary>
+        /// Refuses a WebTransport request from a page the server does not allow with <c>:status 403</c>, as WebTransport asks a server to.
+        /// </summary>
+        /// <param name="stream">The request stream.</param>
+        /// <param name="quicStream">What is kept about it.</param>
+        /// <remarks>
+        /// The response finishes this side of the stream rather than resetting it, so it is delivered, and the client is asked to stop
+        /// sending on its side; the connection is left to close as any that opens no session does. Nothing is logged, so a flood writes no
+        /// log.
+        /// </remarks>
+        private void RefuseForbiddenRequest(IntPtr stream, QuicStream quicStream)
+        {
+            quicStream.Kind = QuicStreamKind.Ignored;
+            quicStream.Count = 0;
+
+            if (TrySendBytes(stream, ForbiddenResponse, MsQuic.SendFinFlag))
+                _msQuic.StreamShutdown(stream, MsQuic.StreamShutdownAbortReceiveFlag, MsQuic.NoErrorCode);
+            else
+                _msQuic.StreamShutdown(stream, MsQuic.StreamShutdownAbortFlag, MsQuic.RequestRejectedErrorCode);
         }
 
         /// <summary>

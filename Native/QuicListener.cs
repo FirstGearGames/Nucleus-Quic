@@ -34,6 +34,15 @@ namespace Nucleus.Integrations.Unity.Transports
         /// </summary>
         private readonly int _maximumReliablePacketSize;
         /// <summary>
+        /// Each origin a browser may connect from, as lowercase ASCII, or empty to accept every origin.
+        /// </summary>
+        /// <remarks>Written once, before the listener starts, so MsQuic's threads read it without a lock.</remarks>
+        private readonly byte[][] _plainAllowedOrigins;
+        /// <summary>
+        /// The origins in <see cref="_plainAllowedOrigins"/> Huffman coded, in the same order, as a browser's QPACK encoder writes one.
+        /// </summary>
+        private readonly byte[][] _huffmanCodedAllowedOrigins;
+        /// <summary>
         /// The most sessions, opened or still opening, the listener holds at once: twice the clients the server admits, or
         /// <see cref="UnsetMaximumSessionCount"/> for no limit.
         /// </summary>
@@ -104,7 +113,8 @@ namespace Nucleus.Integrations.Unity.Transports
         /// <param name="maximumReliablePacketSize">The largest reliable packet a client may send.</param>
         /// <param name="maximumConnections">The most clients the server admits, or <see cref="ServerConfiguration.UnsetMaximumConnections"/> for any number.</param>
         /// <param name="connectingTimeoutMilliseconds">How long an accepted connection has to open its session.</param>
-        private QuicListener(MsQuic msQuic, WebTransportEvents events, int maximumReliablePacketSize, uint maximumConnections, ulong connectingTimeoutMilliseconds)
+        /// <param name="allowedOrigins">The origins a browser may connect from, or empty or <see langword="null"/> for any.</param>
+        private QuicListener(MsQuic msQuic, WebTransportEvents events, int maximumReliablePacketSize, uint maximumConnections, ulong connectingTimeoutMilliseconds, string[] allowedOrigins)
         {
             _msQuic = msQuic;
             _events = events;
@@ -112,6 +122,18 @@ namespace Nucleus.Integrations.Unity.Transports
             _maximumSessionCount = maximumConnections is ServerConfiguration.UnsetMaximumConnections ? UnsetMaximumSessionCount : (int)Math.Min(maximumConnections * 2UL, int.MaxValue);
             _connectingTimeoutStopwatchTicks = (long)(connectingTimeoutMilliseconds * (ulong)Stopwatch.Frequency / 1000);
             _contextHandle = GCHandle.Alloc(this);
+
+            int allowedOriginCount = allowedOrigins?.Length ?? 0;
+
+            _plainAllowedOrigins = new byte[allowedOriginCount][];
+            _huffmanCodedAllowedOrigins = new byte[allowedOriginCount][];
+
+            // Written once as a browser writes an origin, so a request costs a byte compare: in lower case, with no spaces and no closing slash.
+            for (int i = 0; i < allowedOriginCount; i++)
+            {
+                _plainAllowedOrigins[i] = Encoding.ASCII.GetBytes((allowedOrigins[i] ?? string.Empty).Trim().TrimEnd('/').ToLowerInvariant());
+                _huffmanCodedAllowedOrigins[i] = Http3.CreateHuffmanCoding(_plainAllowedOrigins[i]);
+            }
         }
 
         /// <summary>
@@ -181,6 +203,16 @@ namespace Nucleus.Integrations.Unity.Transports
         internal void NotifySessionReleased() => Interlocked.Decrement(ref _sessionCount);
 
         /// <summary>
+        /// Returns whether a request may open a session for the page that sent it: no origins are listed, or it names a listed one or none.
+        /// </summary>
+        /// <param name="source">The bytes holding the request's field section.</param>
+        /// <param name="offset">Where the field section starts.</param>
+        /// <param name="end">Where it ends.</param>
+        /// <returns>True when the request may open a session.</returns>
+        /// <remarks>Called on an MsQuic worker thread, for every WebTransport request. It allocates nothing.</remarks>
+        internal bool IsOriginAllowed(byte[] source, int offset, int end) => _plainAllowedOrigins.Length == 0 || Http3.IsOriginAllowed(source, offset, end, _plainAllowedOrigins, _huffmanCodedAllowedOrigins);
+
+        /// <summary>
         /// Opens a configuration with the server's certificate and starts listening.
         /// </summary>
         /// <param name="msQuic">The MsQuic copy to listen with.</param>
@@ -193,9 +225,10 @@ namespace Nucleus.Integrations.Unity.Transports
         /// <param name="connectedTimeoutSeconds">How long a connection may go unanswered.</param>
         /// <param name="maximumReliablePacketSize">The largest reliable packet a client may send.</param>
         /// <param name="maximumConnections">The most clients the server admits, or <see cref="ServerConfiguration.UnsetMaximumConnections"/> for any number.</param>
+        /// <param name="allowedOrigins">The origins a browser may connect from, or empty for any.</param>
         /// <param name="quicListener">The listener, or <see langword="null"/> when it could not be started.</param>
         /// <returns>True when the server is listening.</returns>
-        internal static bool TryStart(MsQuic msQuic, WebTransportEvents events, byte[] certificate, string certificatePassword, string bindAddress, ushort port, ushort connectingTimeoutSeconds, ushort connectedTimeoutSeconds, int maximumReliablePacketSize, uint maximumConnections, out QuicListener quicListener)
+        internal static bool TryStart(MsQuic msQuic, WebTransportEvents events, byte[] certificate, string certificatePassword, string bindAddress, ushort port, ushort connectingTimeoutSeconds, ushort connectedTimeoutSeconds, int maximumReliablePacketSize, uint maximumConnections, string[] allowedOrigins, out QuicListener quicListener)
         {
             quicListener = null;
 
@@ -207,7 +240,7 @@ namespace Nucleus.Integrations.Unity.Transports
             }
 
             MsQuic.Settings settings = CreateSettings(connectingTimeoutSeconds, connectedTimeoutSeconds, PeerBidirectionalStreamCount, PeerUnidirectionalStreamCount);
-            QuicListener startingQuicListener = new(msQuic, events, maximumReliablePacketSize, maximumConnections, settings.HandshakeIdleTimeoutMilliseconds);
+            QuicListener startingQuicListener = new(msQuic, events, maximumReliablePacketSize, maximumConnections, settings.HandshakeIdleTimeoutMilliseconds, allowedOrigins);
 
             if (!TryOpenConfiguration(msQuic, ref settings, out startingQuicListener._configuration))
             {
