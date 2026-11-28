@@ -116,9 +116,22 @@ namespace Nucleus.Integrations.Unity.Transports
         /// <seealso cref="Transport.ApplyCommandLineArguments()"/>
         public const string AddressArgument = "address";
         /// <summary>
+        /// The <see cref="Configuration.MaximumTransmissionUnit"/> a new transport starts with.
+        /// </summary>
+        /// <remarks>
+        /// Firefox takes WebTransport datagrams of 1024 bytes at most and silently drops a larger one, so this stays under that limit with
+        /// room to spare, and below the engine's own default. Raise it only for a game no player reaches from Firefox.
+        /// </remarks>
+        public const ushort DefaultMaximumTransmissionUnit = 1000;
+        /// <summary>
         /// The address a host's own client is recorded as having connected from.
         /// </summary>
         internal const string LoopbackAddress = "127.0.0.1";
+
+        /// <summary>
+        /// Creates a transport whose maximum transmission unit fits every browser.
+        /// </summary>
+        public Quic() => Configuration.MaximumTransmissionUnit = DefaultMaximumTransmissionUnit;
 
         /// <inheritdoc/>
         /// <remarks>QUIC traffic always crosses a real socket, even between two peers on one machine, so the security checks stay on.</remarks>

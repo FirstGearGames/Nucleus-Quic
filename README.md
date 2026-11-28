@@ -47,7 +47,7 @@ A host's own client, pointed at this machine on the server's port, joins its ser
 | Certificate Hash | empty | Client only. The SHA-256 of the server's certificate as 64 hex characters. Empty trusts only certificates the system or browser already trusts. |
 | Pinned Certificate Validity Limit Enabled | off | Client only. Refuses a pinned certificate that is valid for more than 14 days in total, as a browser does. See [Certificates](#certificates). |
 | Maximum Connections | 0 | Server only. The most clients the server accepts at once. 0 accepts any number. Connections past twice this, counting those still opening, are refused at their handshake. |
-| Maximum Transmission Unit | 1200 | The largest packet built before it is split. Keep it at 1200 unless every network path is known to carry more. |
+| Maximum Transmission Unit | 1000 | The largest packet built before it is split. Firefox silently drops a datagram larger than 1024 bytes, so raise it only when no player connects from Firefox. |
 | Maximum Reliable Packet Size | 1048576 | Server only. The largest reliable packet, in bytes, a client may send. A client that sends a larger one is disconnected. |
 | Allowed Origins | empty | Server only. The web pages a browser may connect from, such as `https://game.example.com`. Empty accepts every page. Native clients are always accepted. See [Allowed origins](#allowed-origins). |
 | Connecting Timeout Seconds | 10 | How long a client waits for the server to answer, and how long the server gives a new connection to open its session before closing it. 0 uses the idle timeout. |

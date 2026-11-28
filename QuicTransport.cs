@@ -127,9 +127,10 @@ namespace Nucleus.Integrations.Unity.Transports
         /// <summary>
         /// The largest packet to build before it is split.
         /// </summary>
+        /// <remarks>Firefox silently drops a datagram larger than 1024 bytes, so raising this loses the largest unreliable packets to and from Firefox players.</remarks>
         [SerializeField]
-        [Tooltip("Largest packet to build before it is split. QUIC needs about 64 bytes of each datagram for itself.")]
-        private ushort _maximumTransmissionUnit = 1200;
+        [Tooltip("Largest packet to build before it is split. QUIC needs about 64 bytes of each datagram for itself. Firefox silently drops datagrams over 1024 bytes, so raise this only when no player uses Firefox.")]
+        private ushort _maximumTransmissionUnit = Quic.DefaultMaximumTransmissionUnit;
         /// <summary>
         /// The largest reliable packet the server accepts from a client.
         /// </summary>

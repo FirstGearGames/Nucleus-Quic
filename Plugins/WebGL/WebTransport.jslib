@@ -3,15 +3,21 @@
 //
 // Unreliable packets are WebTransport datagrams. Reliable packets travel on one two-way stream this side opens, each prefixed with its
 // length as a QUIC variable-length integer, and the stream opens with an empty frame so the server hears of it at once.
+//
+// Every function declares its signature in __sig: a return type, then one letter a parameter, 'p' for a pointer. A Wasm64 build passes
+// pointers as BigInt, and Emscripten only turns them back into numbers for a function whose __sig names them, so without one the first
+// heap access throws and the game loop traps.
 var WebTransportLibrary = {
-    $WebTransportSessions: { nextId: 1, byId: {} },
+    // maximumDatagramsInFlight is the most datagrams a session may have written that the browser has not yet sent.
+    $WebTransportSessions: { nextId: 1, byId: {}, maximumDatagramsInFlight: 32 },
 
+    WebTransportConnect__sig: 'ipp',
     WebTransportConnect: function (urlPointer, certificateHashPointer) {
         var url = UTF8ToString(urlPointer);
         var certificateHash = UTF8ToString(certificateHashPointer);
         var sessionId = WebTransportSessions.nextId++;
         // State is 0 while connecting, 1 once open and 2 once closed.
-        var session = { state: 0, packets: [], transport: null, datagramWriter: null, streamWriter: null };
+        var session = { state: 0, packets: [], transport: null, datagramWriter: null, streamWriter: null, datagramsInFlight: 0, releaseDatagram: null };
         var options = {};
 
         WebTransportSessions.byId[sessionId] = session;
@@ -31,6 +37,13 @@ var WebTransportLibrary = {
 
             session.state = 2;
         }
+
+        // Settles every datagram write, sent or failed. Made once here and held on the session, so a send makes no closure.
+        function releaseDatagram() {
+            session.datagramsInFlight--;
+        }
+
+        session.releaseDatagram = releaseDatagram;
 
         function readDatagrams(reader) {
             reader.read().then(function (result) {
@@ -109,18 +122,21 @@ var WebTransportLibrary = {
         return sessionId;
     },
 
+    WebTransportGetState__sig: 'ii',
     WebTransportGetState: function (sessionId) {
         var session = WebTransportSessions.byId[sessionId];
 
         return session ? session.state : 2;
     },
 
+    WebTransportPeekSize__sig: 'ii',
     WebTransportPeekSize: function (sessionId) {
         var session = WebTransportSessions.byId[sessionId];
 
         return session && session.packets.length > 0 ? session.packets[0].bytes.length : -1;
     },
 
+    WebTransportReceive__sig: 'iipi',
     WebTransportReceive: function (sessionId, bufferPointer, capacity) {
         var session = WebTransportSessions.byId[sessionId];
         var packet = session.packets.shift();
@@ -130,6 +146,7 @@ var WebTransportLibrary = {
         return packet.isReliable ? 1 : 0;
     },
 
+    WebTransportSend__sig: 'iipiii',
     WebTransportSend: function (sessionId, bufferPointer, offset, length, isReliable) {
         var session = WebTransportSessions.byId[sessionId];
 
@@ -139,7 +156,14 @@ var WebTransportLibrary = {
         var start = bufferPointer + offset;
 
         if (!isReliable) {
-            session.datagramWriter.write(HEAPU8.slice(start, start + length)).catch(function () { });
+            /* Past the cap a datagram is dropped, as a full socket drops one, rather than queued: a backlog the browser holds leaves in one
+             * burst, which the server kicks as a flood. A write settles no sooner than the page's next task, so the cap is also the most
+             * datagrams one frame can send. */
+            if (session.datagramsInFlight >= WebTransportSessions.maximumDatagramsInFlight)
+                return 0;
+
+            session.datagramsInFlight++;
+            session.datagramWriter.write(HEAPU8.slice(start, start + length)).then(session.releaseDatagram, session.releaseDatagram);
 
             return 1;
         }
@@ -160,6 +184,7 @@ var WebTransportLibrary = {
         return 1;
     },
 
+    WebTransportClose__sig: 'vi',
     WebTransportClose: function (sessionId) {
         var session = WebTransportSessions.byId[sessionId];
 

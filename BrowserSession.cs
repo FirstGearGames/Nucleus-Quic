@@ -55,6 +55,10 @@ namespace Nucleus.Integrations.Unity.Transports
         }
 
         /// <inheritdoc/>
+        /// <remarks>
+        /// An unreliable packet is dropped, and false returned, while 32 of this session's datagrams wait in the browser unsent, so a stall
+        /// cannot build a backlog that later leaves in one burst. A reliable packet is never dropped.
+        /// </remarks>
         internal override bool TrySend(Channel channel, ArraySegment<byte> payload) => payload.Array is not null && WebTransportSend(_sessionId, payload.Array, payload.Offset, payload.Count, channel is Channel.Reliable ? 1 : 0) != 0;
 
         /// <inheritdoc/>
@@ -138,7 +142,8 @@ namespace Nucleus.Integrations.Unity.Transports
         private static extern int WebTransportReceive(int sessionId, byte[] buffer, int capacity);
 
         /// <summary>
-        /// Sends a packet, copying it first, and returns one when the browser took it.
+        /// Sends a packet, copying it first, and returns one when the browser took it, or zero when the session is not open or a datagram
+        /// was dropped because too many wait unsent.
         /// </summary>
         [DllImport("__Internal")]
         private static extern int WebTransportSend(int sessionId, byte[] buffer, int offset, int length, int isReliable);
