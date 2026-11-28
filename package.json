@@ -1,6 +1,6 @@
 {
   "name": "com.firstgeargames.nucleus.quic",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "displayName": "Nucleus Quic",
   "description": "WebTransport transport for Nucleus over QUIC, so WebGL builds can join the same server as desktop builds. Needs Nucleus in the project.",
   "unity": "6000.5",
